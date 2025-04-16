@@ -1,0 +1,100 @@
+version: 1.2.1
+
+cache: true
+
+registration:
+  socialLogins:
+    - "discord"
+    - "facebook"
+    - "github"
+    - "google"
+    - "openid"
+
+endpoints:
+  azureOpenAI:
+    titleModel: "gpt-4o-mini"
+    plugins: true
+    groups:
+    - group: "rg-alfonsusjason-4523_ai"
+      apiKey: "${AZURE_OPENAI_KEY}"
+      instanceName: "ai-alfonsusjason3535ai303481520578"
+      version: "2024-12-01-preview"
+      models:
+        gpt-4.1:
+          deploymentName: gpt-4.1
+        gpt-4o:
+          deploymentName: gpt-4o
+        gpt-4o-mini:
+          deploymentName: gpt-4o-mini
+  custom:
+    - name: "Github Models"
+      iconURL: https://github.githubassets.com/assets/GitHub-Mark-ea2971cee799.png
+      apiKey: "${GITHUB_TOKEN}"
+      baseURL: "https://models.inference.ai.azure.com"
+      models:
+        default:
+          - AI21-Jamba-Instruct
+          - Cohere-command-r
+          - Cohere-command-r-plus
+          - Cohere-embed-v3-english
+          - Cohere-embed-v3-multilingual
+          - Meta-Llama-3-70B-Instruct
+          - Meta-Llama-3-8B-Instruct
+          - Meta-Llama-3.1-405B-Instruct
+          - Meta-Llama-3.1-70B-Instruct
+          - Meta-Llama-3.1-8B-Instruct
+          - Llama-4-Scout-17B-16E-Instruct
+          - Llama-4-Maverick-17B-128E-Instruct-FP8
+          - Mistral-Nemo
+          - Mistral-large
+          - Mistral-large-2407
+          - Mistral-small
+          - Phi-3-medium-128k-instruct
+          - Phi-3-medium-4k-instruct
+          - Phi-3-mini-128k-instruct
+          - Phi-3-mini-4k-instruct
+          - Phi-3-small-128k-instruct
+          - Phi-3-small-8k-instruct
+          - Phi-3.5-mini-instruct
+          - Phi-4
+          - Phi-4-multimodal-instruct
+          - Phi-4-mini-insruct
+          - DeepSeek-R1
+          - DeepSeek-V3-0324
+          - gpt-4.1
+          - gpt-4.1-mini
+          - gpt-4.1-nano
+          - gpt-4o
+          - gpt-4o-mini
+          - o3-mini
+          - text-embedding-3-large
+          - text-embedding-3-small
+        fetch: false
+      titleConvo: true
+      titleModel: "gpt-4o-mini"
+
+    - name: "OpenRouter"
+      apiKey: "${OPENROUTER_KEY}"
+      baseURL: "https://openrouter.ai/api/v1"
+      models:
+        default:
+          - deepseek/deepseek-r1:free
+          - deepseek/deepseek-chat-v3-0324:free
+          - google/gemini-2.5-pro-exp-03-25:free
+          - google/gemma-3-27b-it:free
+          - meta-llama/llama-3.3-70b-instruct:free
+          - meta-llama/llama-4-maverick:free
+          - qwen/qwen-2-7b-instruct:free
+          - qwen/qwen-2.5-72b-instruct:free
+          - qwen/qwen-2.5-coder-32b-instruct:free
+          - qwen/qwen2.5-vl-72b-instruct:free
+          - qwen/qwq-32b:free
+          - nvidia/llama-3.3-nemotron-super-49b-v1:free
+          - openai/gpt-4.1
+          - openai/gpt-4.1-mini
+          - openai/gpt-4.1-nano
+        fetch: false
+      titleConvo: true
+      titleModel: "deepseek/deepseek-chat-v3-0324:free"
+      forcePrompt: false
+      modelDisplayLabel: "Open Router"
