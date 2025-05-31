@@ -4,10 +4,10 @@
 module.exports = {
   content: ['./src/**/*.{js,jsx,ts,tsx}'],
   // darkMode: 'class',
-  darkMode: ['class'],
+  darkMode: ['class'],  
   theme: {
     fontFamily: {
-      sans: ['Inter', 'sans-serif'],
+      sans: ['SegoeUI', 'Segoe UI', 'Inter', 'sans-serif'],
       mono: ['Roboto Mono', 'monospace'],
     },
     // fontFamily: {
