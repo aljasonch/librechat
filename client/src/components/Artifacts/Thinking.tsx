@@ -7,8 +7,10 @@ import { cn } from '~/utils';
 import store from '~/store';
 
 const BUTTON_STYLES = {
-  base: 'group mt-3 flex w-fit items-center justify-center rounded-xl bg-surface-tertiary px-3 py-2 text-xs leading-[18px] animate-thinking-appear',
+  base: 'group mt-2 flex w-fit items-center justify-center rounded-xl text-sm leading-[18px] animate-thinking-appear',
   icon: 'icon-sm ml-1.5 transform-gpu text-text-primary transition-transform duration-200',
+  shiningText: 'relative inline-block text-text-secondary',
+  shiningTextBefore: 'absolute inset-0 animate-shine',
 } as const;
 
 const CONTENT_STYLES = {
@@ -34,20 +36,45 @@ export const ThinkingButton = memo(
     isExpanded,
     onClick,
     label,
+    isThinking = false,
   }: {
     isExpanded: boolean;
     onClick: (e: MouseEvent<HTMLButtonElement>) => void;
     label: string;
+    isThinking?: boolean;
   }) => (
     <button type="button" onClick={onClick} className={BUTTON_STYLES.base}>
-      <Atom size={14} className="mr-1.5 text-text-secondary" />
-      {label}
-      <ChevronDown className={`${BUTTON_STYLES.icon} ${isExpanded ? 'rotate-180' : ''}`} />
+      <span className={BUTTON_STYLES.shiningText}>
+        {label}
+        {isThinking && (
+          <span 
+            className={BUTTON_STYLES.shiningTextBefore}
+            style={{
+              color: '#d6d6d6',
+              maskImage: 'linear-gradient(to right, transparent 45%, black 50%, transparent 55%)',
+              WebkitMaskImage: 'linear-gradient(to right, transparent 45%, black 50%, transparent 55%)',
+              maskSize: '200% auto',
+              WebkitMaskSize: '200% auto',
+            }}
+          >
+            {label}
+          </span>
+        )}
+      </span>
+      {!isThinking && (
+        <ChevronDown className={`${BUTTON_STYLES.icon} ${isExpanded ? 'rotate-180' : ''}`} />
+      )}
     </button>
   ),
 );
 
-const Thinking: React.ElementType = memo(({ children }: { children: React.ReactNode }) => {
+const Thinking: React.ElementType = memo(({ 
+  children, 
+  isThinking = false 
+}: { 
+  children: React.ReactNode;
+  isThinking?: boolean;
+}) => {
   const localize = useLocalize();
   const showThinking = useRecoilValue<boolean>(store.showThinking);
   const [isExpanded, setIsExpanded] = useState(showThinking);
@@ -57,7 +84,9 @@ const Thinking: React.ElementType = memo(({ children }: { children: React.ReactN
     setIsExpanded((prev) => !prev);
   }, []);
 
-  const label = useMemo(() => localize('com_ui_thoughts'), [localize]);
+  const label = useMemo(() => {
+    return isThinking ? localize('com_ui_thinking') : localize('com_ui_thoughts');
+  }, [localize, isThinking]);
 
   if (children == null) {
     return null;
@@ -66,7 +95,12 @@ const Thinking: React.ElementType = memo(({ children }: { children: React.ReactN
   return (
     <>
       <div className="mb-5">
-        <ThinkingButton isExpanded={isExpanded} onClick={handleClick} label={label} />
+        <ThinkingButton 
+          isExpanded={isExpanded} 
+          onClick={handleClick} 
+          label={label}
+          isThinking={isThinking}
+        />
       </div>
       <div
         className={cn('grid transition-all duration-300 ease-out', isExpanded && 'mb-8')}

@@ -19,6 +19,22 @@ module.exports = {
         authPageWidth: '370px',
       },
       keyframes: {
+        shine: {
+          to: {
+            'mask-position': '-200% center',
+            '-webkit-mask-position': '-200% center',
+          },
+        },
+        'thinking-appear': {
+          '0%': { 
+            opacity: '0',
+            transform: 'translateY(10px)'
+          },
+          '100%': { 
+            opacity: '1',
+            transform: 'translateY(0)'
+          },
+        },
         'accordion-down': {
           from: { height: 0 },
           to: { height: 'var(--radix-accordion-content-height)' },
@@ -29,6 +45,8 @@ module.exports = {
         },
       },
       animation: {
+        'shine': 'shine 2.5s linear infinite',
+        'thinking-appear': 'thinking-appear 0.5s ease-out forwards',
         'fade-in': 'fadeIn 0.5s ease-out forwards',
         'accordion-down': 'accordion-down 0.2s ease-out',
         'accordion-up': 'accordion-up 0.2s ease-out',

@@ -130,6 +130,7 @@ const ContentParts = memo(
                 label={
                   isSubmitting && isLast ? localize('com_ui_thinking') : localize('com_ui_thoughts')
                 }
+                isThinking={isSubmitting && isLast}
               />
             </div>
           )}
