@@ -2,16 +2,7 @@ import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from '
 import type { MouseEvent, ReactNode } from 'react';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
-import {
-  Atom,
-  Check,
-  ChevronDown,
-  Copy,
-  ExternalLink,
-  FileText,
-  Search,
-  Wrench,
-} from 'lucide-react';
+import { Check, ChevronDown, Copy, ExternalLink, FileText, Search, Wrench } from 'lucide-react';
 import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type {
   Agents,
@@ -253,6 +244,47 @@ function getSources(
   return searchResults ? collectSources(searchResults) : [];
 }
 
+function mergeSources(previous: ValidSource[], next: ValidSource[]): ValidSource[] {
+  const sourceMap = new Map<string, ValidSource>();
+
+  const addSource = (source: ValidSource) => {
+    if (!source.link) {
+      return;
+    }
+
+    const existing = sourceMap.get(source.link);
+    if (!existing) {
+      sourceMap.set(source.link, source);
+      return;
+    }
+
+    const mergedSource = { ...existing, ...source, title: source.title || existing.title };
+    if (existing.processed === true || source.processed === true) {
+      mergedSource.processed = true;
+    }
+    sourceMap.set(source.link, mergedSource);
+  };
+
+  previous.forEach(addSource);
+  next.forEach(addSource);
+  return Array.from(sourceMap.values());
+}
+
+function sourcesEqual(first: ValidSource[], second: ValidSource[]): boolean {
+  if (first.length !== second.length) {
+    return false;
+  }
+
+  return first.every((source, index) => {
+    const other = second[index];
+    return (
+      source.link === other.link &&
+      source.title === other.title &&
+      source.processed === other.processed
+    );
+  });
+}
+
 function getUniqueDomainSources(sources: ValidSource[], max: number): ValidSource[] {
   const seen = new Set<string>();
   const result: ValidSource[] = [];
@@ -383,10 +415,26 @@ function WebSearchItem({
 }) {
   const localize = useLocalize();
   const attachments = getAttachments(part);
-  const sources = useMemo(
+  const toolCallId = getStandardToolCall(part)?.id ?? '';
+  const latestSources = useMemo(
     () => getSources(attachments, searchResults),
     [attachments, searchResults],
   );
+  const [sources, setSources] = useState<ValidSource[]>(latestSources);
+  const toolCallIdRef = useRef(toolCallId);
+
+  useEffect(() => {
+    setSources((previousSources) => {
+      if (toolCallIdRef.current !== toolCallId) {
+        toolCallIdRef.current = toolCallId;
+        return latestSources;
+      }
+
+      const mergedSources = mergeSources(previousSources, latestSources);
+      return sourcesEqual(previousSources, mergedSources) ? previousSources : mergedSources;
+    });
+  }, [latestSources, toolCallId]);
+
   const readSources = useMemo(
     () => sources.filter((source) => source.processed === true),
     [sources],
@@ -589,12 +637,11 @@ function Timeline({
             onClick={handleToggle}
             aria-expanded={isExpanded}
             aria-controls={contentId}
-            className="inline-flex min-w-0 items-center gap-1.5 rounded text-sm leading-6 transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy"
+            className="inline-flex min-w-0 items-center gap-1.5 rounded text-base font-medium leading-7 transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy"
           >
-            <Atom className="size-4 shrink-0 text-blue-500" aria-hidden="true" />
             <span className={cn('truncate', isSubmitting && 'thinking-shimmer')}>{label}</span>
             <ChevronDown
-              className={cn('size-3.5 shrink-0 transition-transform', isExpanded && 'rotate-180')}
+              className={cn('size-4 shrink-0 transition-transform', isExpanded && 'rotate-180')}
               aria-hidden="true"
             />
           </button>
@@ -610,9 +657,9 @@ function Timeline({
               className="rounded p-1 text-text-secondary opacity-0 transition-opacity hover:bg-surface-hover hover:text-text-primary focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy group-hover/timeline:opacity-100"
             >
               {isCopied ? (
-                <Check className="size-3.5" aria-hidden="true" />
+                <Check className="size-4" aria-hidden="true" />
               ) : (
-                <Copy className="size-3.5" aria-hidden="true" />
+                <Copy className="size-4" aria-hidden="true" />
               )}
             </button>
           )}

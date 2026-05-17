@@ -2991,10 +2991,10 @@ html {
 
 @keyframes thinkingTextShimmer {
   0% {
-    background-position: 180% 0;
+    background-position: 120% 0;
   }
   100% {
-    background-position: -180% 0;
+    background-position: -120% 0;
   }
 }
 
@@ -3037,17 +3037,17 @@ html {
   background: linear-gradient(
     90deg,
     var(--thinking-shimmer-base) 0%,
-    var(--thinking-shimmer-base) 28%,
-    var(--thinking-shimmer-shine) 44%,
-    var(--thinking-shimmer-shine) 56%,
-    var(--thinking-shimmer-base) 72%,
+    var(--thinking-shimmer-base) 42%,
+    var(--thinking-shimmer-shine) 50%,
+    var(--thinking-shimmer-base) 58%,
     var(--thinking-shimmer-base) 100%
   );
-  background-size: 320% 100%;
+  background-size: 220% 100%;
+  background-repeat: no-repeat;
   background-clip: text;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: thinkingTextShimmer 3s linear infinite;
+  animation: thinkingTextShimmer 5.5s linear infinite;
 }
 
 .dark .thinking-shimmer {

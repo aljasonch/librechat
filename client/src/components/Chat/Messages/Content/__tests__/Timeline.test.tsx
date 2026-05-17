@@ -100,6 +100,68 @@ describe('Timeline', () => {
     expect(screen.getAllByTestId('favicon')).toHaveLength(2);
   });
 
+  it('keeps read web pages visible when later stream updates omit processed flags', () => {
+    const webPart = {
+      type: ContentTypes.TOOL_CALL,
+      [ContentTypes.TOOL_CALL]: {
+        id: 'web-1',
+        type: ToolCallTypes.TOOL_CALL,
+        name: Tools.web_search,
+        args: '{}',
+        progress: 1,
+        output: 'done',
+      },
+    } as unknown as TMessageContentParts;
+    const webAttachment = {
+      type: Tools.web_search,
+      toolCallId: 'web-1',
+      [Tools.web_search]: {
+        turn: 0,
+        organic: [{ title: 'Result A', link: 'https://a.example/path', processed: true }],
+      },
+    } as unknown as TAttachment;
+    const laterWebAttachment = {
+      type: Tools.web_search,
+      toolCallId: 'web-1',
+      [Tools.web_search]: {
+        turn: 0,
+        organic: [{ title: 'Result A', link: 'https://a.example/path' }],
+      },
+    } as unknown as TAttachment;
+
+    const timelineProps = {
+      parts: [{ idx: 0, part: webPart }],
+      isSubmitting: true,
+      isLast: true,
+      lastContentIdx: 0,
+      searchResults: undefined,
+      renderPart: () => null,
+    };
+
+    const { rerender } = render(
+      <RecoilRoot>
+        <Timeline
+          {...timelineProps}
+          getAttachments={(part) => (part === webPart ? [webAttachment] : undefined)}
+        />
+      </RecoilRoot>,
+    );
+
+    expect(screen.getByText('Read 1 pages')).toBeInTheDocument();
+
+    rerender(
+      <RecoilRoot>
+        <Timeline
+          {...timelineProps}
+          getAttachments={(part) => (part === webPart ? [laterWebAttachment] : undefined)}
+        />
+      </RecoilRoot>,
+    );
+
+    expect(screen.getByText('Read 1 pages')).toBeInTheDocument();
+    expect(screen.getByText('Result A')).toBeInTheDocument();
+  });
+
   it('turns bold thinking summaries into separate titled bullet nodes', () => {
     renderTimeline({
       parts: [
