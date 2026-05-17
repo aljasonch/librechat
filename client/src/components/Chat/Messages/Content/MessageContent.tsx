@@ -182,7 +182,9 @@ const MessageContent = ({
   return (
     <>
       {thinkingContent.length > 0 && (
-        <Thinking key={`thinking-${messageId}`}>{thinkingContent}</Thinking>
+        <Thinking key={`thinking-${messageId}`} isThinking={isSubmitting && isLast}>
+          {thinkingContent}
+        </Thinking>
       )}
       <DisplayMessage
         key={`display-${messageId}`}
