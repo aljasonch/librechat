@@ -1,5 +1,5 @@
 import { memo, useMemo, useCallback } from 'react';
-import { ContentTypes } from 'librechat-data-provider';
+import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type {
   TMessageContentParts,
   SearchResultData,
@@ -14,10 +14,36 @@ import PendingSkillCall from './Parts/PendingSkillCall';
 import MemoryArtifacts from './MemoryArtifacts';
 import ToolCallGroup from './ToolCallGroup';
 import Container from './Container';
+import Timeline from './Timeline';
 import Part from './Part';
 
 const getToolCallId = (part: TMessageContentParts): string =>
   (part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined)?.id ?? '';
+
+const getStandardToolCallName = (part: TMessageContentParts): string => {
+  if (part.type !== ContentTypes.TOOL_CALL) {
+    return '';
+  }
+  const toolCall = part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+  if (!toolCall || !('args' in toolCall)) {
+    return '';
+  }
+  if (toolCall.type && toolCall.type !== ToolCallTypes.TOOL_CALL) {
+    return '';
+  }
+  return toolCall.name ?? '';
+};
+
+const isActivityPart = (part: TMessageContentParts): boolean =>
+  part.type === ContentTypes.THINK || part.type === ContentTypes.TOOL_CALL;
+
+const isTimelineAnchorPart = (part: TMessageContentParts): boolean =>
+  part.type === ContentTypes.THINK || getStandardToolCallName(part) === Tools.web_search;
+
+type RenderUnit =
+  | { type: 'single'; part: PartWithIndex }
+  | { type: 'tool-group'; parts: PartWithIndex[]; groupAttachments: TAttachment[] }
+  | { type: 'timeline'; parts: PartWithIndex[] };
 
 type PartWithContextProps = {
   part: TMessageContentParts;
@@ -263,19 +289,56 @@ const ContentParts = memo(function ContentParts({
     return result;
   }, [content]);
 
-  const groupedParts = useMemo(
-    () =>
-      groupSequentialToolCalls(sequentialParts).map((group) => {
+  const renderUnits = useMemo<RenderUnit[]>(() => {
+    const units: RenderUnit[] = [];
+    let pendingParts: PartWithIndex[] = [];
+
+    const flushPendingParts = () => {
+      if (pendingParts.length === 0) {
+        return;
+      }
+      for (const group of groupSequentialToolCalls(pendingParts)) {
         if (group.type === 'single') {
-          return group;
+          units.push(group);
+          continue;
         }
-        const groupAttachments = group.parts.flatMap(
-          ({ part }) => attachmentMap[getToolCallId(part)] ?? [],
-        );
-        return { ...group, groupAttachments };
-      }),
-    [sequentialParts, attachmentMap],
-  );
+        units.push({
+          ...group,
+          groupAttachments: group.parts.flatMap(
+            ({ part }) => attachmentMap[getToolCallId(part)] ?? [],
+          ),
+        });
+      }
+      pendingParts = [];
+    };
+
+    for (let index = 0; index < sequentialParts.length; ) {
+      const item = sequentialParts[index];
+      if (!isCreatedByUser && isActivityPart(item.part)) {
+        const activityBlock: PartWithIndex[] = [];
+        let cursor = index;
+        while (cursor < sequentialParts.length && isActivityPart(sequentialParts[cursor].part)) {
+          activityBlock.push(sequentialParts[cursor]);
+          cursor += 1;
+        }
+
+        if (activityBlock.some(({ part }) => isTimelineAnchorPart(part))) {
+          flushPendingParts();
+          units.push({ type: 'timeline', parts: activityBlock });
+        } else {
+          pendingParts.push(...activityBlock);
+        }
+        index = cursor;
+        continue;
+      }
+
+      pendingParts.push(item);
+      index += 1;
+    }
+
+    flushPendingParts();
+    return units;
+  }, [sequentialParts, attachmentMap, isCreatedByUser]);
 
   // Early return: no content to render AND no pending skill cards
   if (!content && !hasPendingSkills) {
@@ -356,10 +419,24 @@ const ContentParts = memo(function ContentParts({
           <EmptyText />
         </Container>
       )}
-      {groupedParts.map((group) => {
+      {renderUnits.map((group) => {
         if (group.type === 'single') {
           const { part, idx } = group.part;
           return renderPart(part, idx, idx === lastContentIdx);
+        }
+        if (group.type === 'timeline') {
+          return (
+            <Timeline
+              key={`timeline-${group.parts[0].idx}`}
+              parts={group.parts}
+              isSubmitting={effectiveIsSubmitting}
+              isLast={group.parts.some((p) => p.idx === lastContentIdx)}
+              lastContentIdx={lastContentIdx}
+              searchResults={searchResults}
+              getAttachments={(part) => attachmentMap[getToolCallId(part)]}
+              renderPart={renderPart}
+            />
+          );
         }
         return (
           <ToolCallGroup

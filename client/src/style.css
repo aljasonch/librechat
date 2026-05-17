@@ -2172,6 +2172,33 @@ html {
   display: none !important;
 }
 
+/* Hide the generated streaming dot only while the assistant is actively responding. */
+.submitting .result-thinking:empty:last-child:after,
+.result-streaming.submitting > :not(ol):not(ul):not(pre):last-child:after,
+.result-streaming.submitting > pre:last-child code:after {
+  content: none;
+  display: none;
+}
+
+@supports (selector(:has(*))) {
+  .result-streaming.submitting
+    > :is(ul, ol):last-child
+    > li:last-child:not(:has(> :is(ul, ol, pre))):after {
+    content: none;
+    display: none;
+  }
+}
+
+@supports not (selector(:has(*))) {
+  .result-streaming.submitting > ol:last-child > li:last-child:after,
+  .result-streaming.submitting > ul:last-child > li:last-child:after,
+  .result-streaming.submitting > ol:last-child > li:last-child > pre:last-child code:after,
+  .result-streaming.submitting > ul:last-child > li:last-child > pre:last-child code:after {
+    content: none;
+    display: none;
+  }
+}
+
 .webkit-dark-styles,
 .webkit-dark-styles:focus {
   background-clip: content-box;
@@ -2536,6 +2563,23 @@ html {
   line-height: 1.4;
 }
 
+.streaming-word {
+  display: inline-block;
+  opacity: 0;
+  transition: opacity 0.45s ease;
+}
+
+.streaming-word.visible {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-word {
+    opacity: 1;
+    transition: none;
+  }
+}
+
 .message-content pre code {
   font-size: calc(0.9 * var(--markdown-font-size, var(--font-size-base)));
 }
@@ -2888,6 +2932,15 @@ html {
   }
 }
 
+@keyframes thinkingTextShimmer {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -180% 0;
+  }
+}
+
 .shimmer {
   display: inline-block;
   position: relative;
@@ -2916,6 +2969,40 @@ html {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   animation: shimmer 4s linear infinite;
+}
+
+.thinking-shimmer {
+  --thinking-shimmer-base: var(--text-secondary);
+  --thinking-shimmer-shine: var(--text-primary);
+
+  display: inline-block;
+  color: var(--thinking-shimmer-base);
+  background: linear-gradient(
+    90deg,
+    var(--thinking-shimmer-base) 0%,
+    var(--thinking-shimmer-base) 28%,
+    var(--thinking-shimmer-shine) 44%,
+    var(--thinking-shimmer-shine) 56%,
+    var(--thinking-shimmer-base) 72%,
+    var(--thinking-shimmer-base) 100%
+  );
+  background-size: 320% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: thinkingTextShimmer 3s linear infinite;
+}
+
+.dark .thinking-shimmer {
+  --thinking-shimmer-shine: rgba(255, 255, 255, 0.95);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-shimmer {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    animation: none;
+  }
 }
 
 .custom-style-2 {

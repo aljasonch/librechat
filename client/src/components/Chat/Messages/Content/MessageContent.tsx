@@ -26,17 +26,21 @@ const parseThinkingContent = (text: string) => {
   };
 };
 
-const LoadingFallback = () => (
-  <div className="text-message mb-[0.625rem] flex min-h-[20px] flex-col items-start gap-3 overflow-visible">
-    <div className="markdown prose dark:prose-invert light w-full break-words dark:text-gray-100">
-      <div className="absolute">
-        <p className="submitting relative">
-          <span className="result-thinking" />
-        </p>
+const LoadingFallback = () => {
+  const localize = useLocalize();
+
+  return (
+    <div className="text-message mb-[0.625rem] flex min-h-[20px] flex-col items-start gap-3 overflow-visible">
+      <div className="markdown prose dark:prose-invert light w-full break-words dark:text-gray-100">
+        <div aria-live="polite" aria-atomic="true">
+          <span className="thinking-shimmer text-sm font-medium">
+            {localize('com_ui_thinking')}
+          </span>
+        </div>
       </div>
     </div>
-  </div>
-);
+  );
+};
 
 const ErrorBox = ({
   children,
@@ -102,13 +106,19 @@ const DisplayMessage = ({ text, isCreatedByUser, message, showCursor }: TDisplay
 
   const content = useMemo(() => {
     if (!isCreatedByUser) {
-      return <Markdown content={text} isLatestMessage={isLatestMessage} />;
+      return (
+        <Markdown
+          content={text}
+          animateWords={isSubmitting && isLatestMessage}
+          isLatestMessage={isLatestMessage}
+        />
+      );
     }
     if (enableUserMsgMarkdown) {
       return <MarkdownLite content={text} />;
     }
     return <>{text}</>;
-  }, [isCreatedByUser, enableUserMsgMarkdown, text, isLatestMessage]);
+  }, [isCreatedByUser, enableUserMsgMarkdown, isSubmitting, text, isLatestMessage]);
 
   return (
     <Container message={message}>

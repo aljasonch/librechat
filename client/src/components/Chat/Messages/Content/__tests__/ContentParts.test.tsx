@@ -1,6 +1,6 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
-import { ContentTypes } from 'librechat-data-provider';
+import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessageContentParts } from 'librechat-data-provider';
 
 jest.mock('~/utils', () => ({
@@ -38,6 +38,13 @@ jest.mock('../Parts/PendingSkillCall', () => ({
 jest.mock('../ToolCallGroup', () => ({
   __esModule: true,
   default: () => <div data-testid="tool-call-group" />,
+}));
+
+jest.mock('../Timeline', () => ({
+  __esModule: true,
+  default: ({ parts }: { parts: Array<{ part: TMessageContentParts; idx: number }> }) => (
+    <div data-testid="activity-timeline" data-count={String(parts.length)} />
+  ),
 }));
 
 jest.mock('../Container', () => ({
@@ -136,5 +143,42 @@ describe('ContentParts — interim skill cards', () => {
     expect(skillCard).toBeTruthy();
     expect(textPart).toBeTruthy();
     expect(skillCard.compareDocumentPosition(textPart)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('renders assistant thought and web search activity as one compact timeline', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'searching first' } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.TOOL_CALL,
+        [ContentTypes.TOOL_CALL]: {
+          id: 'web-1',
+          type: ToolCallTypes.TOOL_CALL,
+          name: Tools.web_search,
+          args: '{}',
+          output: 'done',
+          progress: 1,
+        },
+      } as unknown as TMessageContentParts,
+      { type: ContentTypes.TEXT, text: 'final answer' } as unknown as TMessageContentParts,
+    ];
+
+    render(<ContentParts {...baseProps} content={content} />);
+
+    expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-count', '2');
+    expect(screen.getByTestId(`real-part-${ContentTypes.TEXT}`)).toBeInTheDocument();
+  });
+
+  it('does not render the activity timeline for user messages', () => {
+    const content: TMessageContentParts[] = [
+      {
+        type: ContentTypes.THINK,
+        think: 'not assistant activity',
+      } as unknown as TMessageContentParts,
+    ];
+
+    render(<ContentParts {...baseProps} content={content} isCreatedByUser />);
+
+    expect(screen.queryByTestId('activity-timeline')).not.toBeInTheDocument();
+    expect(screen.getByTestId(`real-part-${ContentTypes.THINK}`)).toBeInTheDocument();
   });
 });

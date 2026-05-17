@@ -24,13 +24,19 @@ const TextPart = memo(function TextPart({ text, isCreatedByUser, showCursor }: T
 
   const content: ContentType = useMemo(() => {
     if (!isCreatedByUser) {
-      return <Markdown content={text} isLatestMessage={isLatestMessage} />;
+      return (
+        <Markdown
+          content={text}
+          animateWords={isSubmitting && isLatestMessage}
+          isLatestMessage={isLatestMessage}
+        />
+      );
     } else if (enableUserMsgMarkdown) {
       return <MarkdownLite content={text} />;
     } else {
       return <>{text}</>;
     }
-  }, [isCreatedByUser, enableUserMsgMarkdown, text, isLatestMessage]);
+  }, [isCreatedByUser, enableUserMsgMarkdown, isSubmitting, text, isLatestMessage]);
 
   return (
     <div

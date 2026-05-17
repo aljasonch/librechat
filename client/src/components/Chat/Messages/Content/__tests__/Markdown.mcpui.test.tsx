@@ -108,3 +108,67 @@ describe('Markdown with MCP UI markers (resource IDs)', () => {
     expect(renderers[1]).toHaveAttribute('data-resource-uri', 'ui://weather/nyc');
   });
 });
+
+describe('Markdown streaming word animation', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUseMessageContext.mockReturnValue({ messageId: 'msg-stream', partIndex: 0 } as any);
+    mockUseLocalize.mockReturnValue(((key: string) => key) as any);
+  });
+
+  it('shows the shimmer thinking placeholder only for the latest initializing message', () => {
+    const { container, rerender } = render(
+      <RecoilRoot>
+        <Markdown content="" isLatestMessage={true} />
+      </RecoilRoot>,
+    );
+
+    expect(screen.getByText('com_ui_thinking')).toHaveClass('thinking-shimmer');
+
+    rerender(
+      <RecoilRoot>
+        <Markdown content="" isLatestMessage={false} />
+      </RecoilRoot>,
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('wraps prose words only when streaming word animation is enabled', () => {
+    const { container, rerender } = render(
+      <RecoilRoot>
+        <Markdown content="Hello **bright** world" isLatestMessage={true} />
+      </RecoilRoot>,
+    );
+
+    expect(container.querySelectorAll('[data-streaming-word]')).toHaveLength(0);
+
+    rerender(
+      <RecoilRoot>
+        <Markdown content="Hello **bright** world" animateWords={true} isLatestMessage={true} />
+      </RecoilRoot>,
+    );
+
+    const words = Array.from(container.querySelectorAll('[data-streaming-word]'));
+    expect(words.map((word) => word.textContent)).toEqual(['Hello', 'bright', 'world']);
+  });
+
+  it('does not wrap code words for streaming animation', () => {
+    const { container } = render(
+      <RecoilRoot>
+        <Markdown
+          animateWords={true}
+          content={'A word before `const value = "still code";`'}
+          isLatestMessage={true}
+        />
+      </RecoilRoot>,
+    );
+
+    const animatedWords = Array.from(container.querySelectorAll('[data-streaming-word]')).map(
+      (word) => word.textContent,
+    );
+
+    expect(animatedWords).toEqual(['A', 'word', 'before']);
+    expect(container.querySelector('code')?.textContent).toContain('const value');
+  });
+});
