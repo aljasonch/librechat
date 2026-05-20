@@ -2991,10 +2991,11 @@ html {
 
 @keyframes thinkingTextShimmer {
   0% {
-    background-position: 120% 0;
+    background-position: 100% 0;
   }
+  32%,
   100% {
-    background-position: -120% 0;
+    background-position: 0% 0;
   }
 }
 
@@ -3029,29 +3030,36 @@ html {
 }
 
 .thinking-shimmer {
-  --thinking-shimmer-base: var(--text-secondary);
-  --thinking-shimmer-shine: var(--text-primary);
+  --spread: 2em;
+  --shimmer-duration: 2s;
+  --thinking-shimmer-highlight: rgba(245, 245, 245, 0.95);
+  --thinking-shimmer-muted: rgba(150, 150, 150, 0.72);
 
+  position: relative;
   display: inline-block;
-  color: var(--thinking-shimmer-base);
-  background: linear-gradient(
-    90deg,
-    var(--thinking-shimmer-base) 0%,
-    var(--thinking-shimmer-base) 42%,
-    var(--thinking-shimmer-shine) 50%,
-    var(--thinking-shimmer-base) 58%,
-    var(--thinking-shimmer-base) 100%
-  );
-  background-size: 220% 100%;
-  background-repeat: no-repeat;
+  font-weight: 700;
+  color: transparent;
+  background-image:
+    linear-gradient(
+      90deg,
+      #0000 calc(50% - var(--spread)),
+      var(--thinking-shimmer-highlight),
+      #0000 calc(50% + var(--spread))
+    ),
+    linear-gradient(var(--thinking-shimmer-muted), var(--thinking-shimmer-muted));
+  background-size:
+    250% 100%,
+    auto;
+  background-repeat: no-repeat, no-repeat;
   background-clip: text;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: thinkingTextShimmer 5.5s linear infinite;
+  animation: thinkingTextShimmer var(--shimmer-duration) ease-out infinite;
 }
 
 .dark .thinking-shimmer {
-  --thinking-shimmer-shine: rgba(255, 255, 255, 0.95);
+  --thinking-shimmer-highlight: rgba(245, 245, 245, 0.92);
+  --thinking-shimmer-muted: rgba(150, 150, 150, 0.68);
 }
 
 @media (prefers-reduced-motion: reduce) {

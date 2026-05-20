@@ -17,6 +17,7 @@ import { useExpandCollapse, useLocalize } from '~/hooks';
 import { showThinkingAtom } from '~/store/showThinking';
 import { getToolDisplayLabel } from '~/utils/toolLabels';
 import { isBashProgrammaticToolCall } from './routing';
+import TextShimmer from './TextShimmer';
 import cn from '~/utils/cn';
 import store from '~/store';
 
@@ -639,7 +640,11 @@ function Timeline({
             aria-controls={contentId}
             className="inline-flex min-w-0 items-center gap-1.5 rounded text-base font-medium leading-7 transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy"
           >
-            <span className={cn('truncate', isSubmitting && 'thinking-shimmer')}>{label}</span>
+            {isSubmitting ? (
+              <TextShimmer className="truncate">{label}</TextShimmer>
+            ) : (
+              <span className="truncate">{label}</span>
+            )}
             <ChevronDown
               className={cn('size-4 shrink-0 transition-transform', isExpanded && 'rotate-180')}
               aria-hidden="true"

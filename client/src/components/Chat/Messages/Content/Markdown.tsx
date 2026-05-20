@@ -22,6 +22,7 @@ import { unicodeCitation } from '~/components/Web';
 import { code, a, p, img } from './MarkdownComponents';
 import { rehypeStreamingWords, StreamingSpan } from './streaming';
 import { useLocalize } from '~/hooks';
+import TextShimmer from './TextShimmer';
 import store from '~/store';
 
 type TContentProps = {
@@ -80,7 +81,7 @@ const Markdown = memo(function Markdown({
 
     return (
       <div aria-live="polite" aria-atomic="true">
-        <span className="thinking-shimmer text-sm font-medium">{localize('com_ui_thinking')}</span>
+        <TextShimmer className="text-sm font-medium">{localize('com_ui_thinking')}</TextShimmer>
       </div>
     );
   }
