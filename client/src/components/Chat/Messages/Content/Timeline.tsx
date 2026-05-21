@@ -109,6 +109,10 @@ function getLatestThoughtTitle(text: string): string {
   return '';
 }
 
+function stripTrailingEllipsis(text: string): string {
+  return text.replace(/\s*(?:\.{3}|\u2026)+$/u, '');
+}
+
 function getReasoningText(part: TMessageContentParts): string {
   if (part.type !== ContentTypes.THINK) {
     return '';
@@ -372,8 +376,12 @@ function ReadLinks({ sources }: { sources: ValidSource[] }) {
 
 function TimelineNode({ children, icon }: { children: ReactNode; icon?: ReactNode }) {
   return (
-    <div className="relative pb-3 last:pb-0">
-      <span className="absolute -left-[17px] top-[0.45rem] flex size-3 items-center justify-center text-text-secondary">
+    <div className="group/timeline-node relative pb-4 pl-6 last:pb-0">
+      <span
+        className="absolute bottom-0 left-2 top-6 border-l border-border-light group-last/timeline-node:hidden"
+        aria-hidden="true"
+      />
+      <span className="absolute left-0 top-1 flex size-4 items-center justify-center text-text-secondary">
         {icon ?? (
           <span className="size-1.5 rounded-full bg-text-secondary ring-2 ring-surface-primary" />
         )}
@@ -600,6 +608,10 @@ function Timeline({
     [parts],
   );
   const activeThoughtTitle = useMemo(() => getLatestThoughtTitle(thoughtText), [thoughtText]);
+  const thinkingLabel = useMemo(
+    () => stripTrailingEllipsis(localize('com_ui_thinking')),
+    [localize],
+  );
 
   const handleCopy = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -621,13 +633,13 @@ function Timeline({
 
   const label = useMemo(() => {
     if (isSubmitting) {
-      return activeThoughtTitle || localize('com_ui_thinking');
+      return activeThoughtTitle || thinkingLabel;
     }
     if (elapsedSeconds != null) {
       return localize('com_ui_thought_for_seconds', { 0: String(Math.max(1, elapsedSeconds)) });
     }
     return localize('com_ui_thoughts');
-  }, [activeThoughtTitle, elapsedSeconds, isSubmitting, localize]);
+  }, [activeThoughtTitle, elapsedSeconds, isSubmitting, localize, thinkingLabel]);
 
   return (
     <section className="my-2" data-testid="activity-timeline">
@@ -677,7 +689,7 @@ function Timeline({
           style={style}
         >
           <div className="overflow-hidden" ref={ref}>
-            <div className="ml-[7px] mt-2 border-l border-border-light pl-3">
+            <div className="mt-2">
               {parts.map(({ part, idx }) => {
                 if (part.type === ContentTypes.THINK) {
                   return <ThoughtItem key={`thought-${idx}`} text={getReasoningText(part)} />;

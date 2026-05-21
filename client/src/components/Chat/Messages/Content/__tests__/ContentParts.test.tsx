@@ -168,6 +168,20 @@ describe('ContentParts — interim skill cards', () => {
     expect(screen.getByTestId(`real-part-${ContentTypes.TEXT}`)).toBeInTheDocument();
   });
 
+  it('shows the loading dot instead of a timeline for placeholder thinking text', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'Thinking...' } as unknown as TMessageContentParts,
+    ];
+
+    render(
+      <ContentParts {...baseProps} content={content} isSubmitting={true} isLatestMessage={true} />,
+    );
+
+    expect(screen.getByTestId('empty-text')).toBeInTheDocument();
+    expect(screen.queryByTestId('activity-timeline')).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`real-part-${ContentTypes.THINK}`)).not.toBeInTheDocument();
+  });
+
   it('does not render the activity timeline for user messages', () => {
     const content: TMessageContentParts[] = [
       {

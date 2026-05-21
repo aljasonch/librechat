@@ -21,8 +21,6 @@ import { langSubset, preprocessLaTeX } from '~/utils';
 import { unicodeCitation } from '~/components/Web';
 import { code, a, p, img } from './MarkdownComponents';
 import { rehypeStreamingWords, StreamingSpan } from './streaming';
-import { useLocalize } from '~/hooks';
-import TextShimmer from './TextShimmer';
 import store from '~/store';
 
 type TContentProps = {
@@ -36,7 +34,6 @@ const Markdown = memo(function Markdown({
   isLatestMessage,
   animateWords = false,
 }: TContentProps) {
-  const localize = useLocalize();
   const LaTeXParsing = useRecoilValue<boolean>(store.LaTeXParsing);
   const isInitializing = content === '';
 
@@ -80,8 +77,10 @@ const Markdown = memo(function Markdown({
     }
 
     return (
-      <div aria-live="polite" aria-atomic="true">
-        <TextShimmer className="text-sm font-medium">{localize('com_ui_thinking')}</TextShimmer>
+      <div className="absolute" aria-live="polite" aria-atomic="true">
+        <p className="submitting relative">
+          <span className="result-thinking" />
+        </p>
       </div>
     );
   }

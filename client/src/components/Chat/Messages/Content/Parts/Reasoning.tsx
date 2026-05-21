@@ -13,6 +13,8 @@ type ReasoningProps = {
   isLast: boolean;
 };
 
+const stripTrailingEllipsis = (text: string): string => text.replace(/\s*(?:\.{3}|…)+$/u, '');
+
 /**
  * Reasoning Component (MODERN SYSTEM)
  *
@@ -79,11 +81,14 @@ const Reasoning = memo(({ reasoning, isLast }: ReasoningProps) => {
   }, []);
 
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
+  const thinkingLabel = useMemo(
+    () => stripTrailingEllipsis(localize('com_ui_thinking')),
+    [localize],
+  );
 
   const label = useMemo(
-    () =>
-      effectiveIsSubmitting && isLast ? localize('com_ui_thinking') : localize('com_ui_thoughts'),
-    [effectiveIsSubmitting, localize, isLast],
+    () => (effectiveIsSubmitting && isLast ? thinkingLabel : localize('com_ui_thoughts')),
+    [effectiveIsSubmitting, localize, isLast, thinkingLabel],
   );
 
   if (!reasoningText) {

@@ -34,11 +34,36 @@ const getStandardToolCallName = (part: TMessageContentParts): string => {
   return toolCall.name ?? '';
 };
 
+const stripThinkTags = (value: string): string =>
+  value
+    .replace(/^<think>\s*/i, '')
+    .replace(/\s*<\/think>$/i, '')
+    .trim();
+
+const getReasoningText = (part: TMessageContentParts): string => {
+  if (part.type !== ContentTypes.THINK) {
+    return '';
+  }
+  const value = typeof part.think === 'string' ? part.think : (part.think?.value ?? '');
+  return stripThinkTags(value);
+};
+
+const isPlaceholderReasoning = (text: string): boolean =>
+  text
+    .trim()
+    .replace(/\s*(?:\.{3}|…)+$/u, '')
+    .toLowerCase() === 'thinking';
+
+const hasRenderableReasoning = (part: TMessageContentParts): boolean => {
+  const text = getReasoningText(part);
+  return text.length > 0 && !isPlaceholderReasoning(text);
+};
+
 const isActivityPart = (part: TMessageContentParts): boolean =>
-  part.type === ContentTypes.THINK || part.type === ContentTypes.TOOL_CALL;
+  hasRenderableReasoning(part) || part.type === ContentTypes.TOOL_CALL;
 
 const isTimelineAnchorPart = (part: TMessageContentParts): boolean =>
-  part.type === ContentTypes.THINK || getStandardToolCallName(part) === Tools.web_search;
+  hasRenderableReasoning(part) || getStandardToolCallName(part) === Tools.web_search;
 
 type RenderUnit =
   | { type: 'single'; part: PartWithIndex }
@@ -199,6 +224,9 @@ const ContentParts = memo(function ContentParts({
         if (part == null) {
           return false;
         }
+        if (part.type === ContentTypes.THINK) {
+          return hasRenderableReasoning(part);
+        }
         if (part.type !== ContentTypes.TEXT) {
           return true;
         }
@@ -283,6 +311,9 @@ const ContentParts = memo(function ContentParts({
     const result: PartWithIndex[] = [];
     content.forEach((part, idx) => {
       if (part) {
+        if (part.type === ContentTypes.THINK && !hasRenderableReasoning(part)) {
+          return;
+        }
         result.push({ part, idx });
       }
     });
@@ -387,8 +418,8 @@ const ContentParts = memo(function ContentParts({
   }
 
   const safeContent = content ?? [];
-  const showEmptyCursor = safeContent.length === 0 && effectiveIsSubmitting;
-  const lastContentIdx = safeContent.length - 1;
+  const lastContentIdx = sequentialParts.at(-1)?.idx ?? safeContent.length - 1;
+  const showEmptyCursor = sequentialParts.length === 0 && effectiveIsSubmitting;
 
   // Parallel content: use dedicated renderer with columns (TMessageContentParts includes ContentMetadata)
   const hasParallelContent = safeContent.some((part) => part?.groupId != null);

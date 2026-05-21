@@ -15,7 +15,7 @@ jest.mock('~/hooks', () => ({
       com_ui_found_n_web_pages: `Found ${values?.[0] ?? '0'} web pages`,
       com_ui_read_n_pages: `Read ${values?.[0] ?? '0'} pages`,
       com_ui_thought_for_seconds: `Thought for ${values?.[0] ?? '0'} seconds`,
-      com_ui_thinking: 'Thinking',
+      com_ui_thinking: 'Thinking...',
       com_ui_thoughts: 'Thoughts',
       com_ui_tools: 'Tools',
       com_ui_view_all: 'View All',
@@ -190,6 +190,23 @@ describe('Timeline', () => {
     expect(screen.getByRole('button', { name: /Evaluating sources/ })).toBeInTheDocument();
     expect(screen.queryByText(/Thought for/)).not.toBeInTheDocument();
     expect(screen.queryByText(/\*\*Researching overview\*\*/)).not.toBeInTheDocument();
+  });
+
+  it('shows the live fallback title without an ellipsis', () => {
+    renderTimeline({
+      parts: [
+        {
+          idx: 0,
+          part: {
+            type: ContentTypes.THINK,
+            think: 'I am checking this without a bold heading.',
+          } as unknown as TMessageContentParts,
+        },
+      ],
+    });
+
+    expect(screen.getByRole('button', { name: /Thinking/ })).toBeInTheDocument();
+    expect(screen.queryByText('Thinking...')).not.toBeInTheDocument();
   });
 
   it('keeps generic tool detail collapsible inside the timeline', () => {

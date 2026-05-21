@@ -116,14 +116,15 @@ describe('Markdown streaming word animation', () => {
     mockUseLocalize.mockReturnValue(((key: string) => key) as any);
   });
 
-  it('shows the shimmer thinking placeholder only for the latest initializing message', () => {
+  it('shows only LibreChat loading cursor for the latest initializing message', () => {
     const { container, rerender } = render(
       <RecoilRoot>
         <Markdown content="" isLatestMessage={true} />
       </RecoilRoot>,
     );
 
-    expect(screen.getByText('com_ui_thinking')).toHaveClass('thinking-shimmer');
+    expect(container.querySelector('.result-thinking')).toBeInTheDocument();
+    expect(screen.queryByText('com_ui_thinking')).not.toBeInTheDocument();
 
     rerender(
       <RecoilRoot>

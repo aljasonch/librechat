@@ -11,7 +11,7 @@ module.exports = {
   darkMode: ['class'],
   theme: {
     fontFamily: {
-      sans: ['SegoeUI', 'Segoe UI', 'Inter', 'sans-serif'],
+      sans: ['Inter', 'sans-serif'],
       mono: ['Roboto Mono', 'monospace'],
     },
     // fontFamily: {
