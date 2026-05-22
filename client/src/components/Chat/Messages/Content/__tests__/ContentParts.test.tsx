@@ -42,8 +42,21 @@ jest.mock('../ToolCallGroup', () => ({
 
 jest.mock('../Timeline', () => ({
   __esModule: true,
-  default: ({ parts }: { parts: Array<{ part: TMessageContentParts; idx: number }> }) => (
-    <div data-testid="activity-timeline" data-count={String(parts.length)} />
+  default: ({
+    parts,
+    isSubmitting,
+    isLast,
+  }: {
+    parts: Array<{ part: TMessageContentParts; idx: number }>;
+    isSubmitting: boolean;
+    isLast: boolean;
+  }) => (
+    <div
+      data-testid="activity-timeline"
+      data-count={String(parts.length)}
+      data-submitting={String(isSubmitting)}
+      data-last={String(isLast)}
+    />
   ),
 }));
 
@@ -166,6 +179,49 @@ describe('ContentParts — interim skill cards', () => {
 
     expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-count', '2');
     expect(screen.getByTestId(`real-part-${ContentTypes.TEXT}`)).toBeInTheDocument();
+  });
+
+  it('marks the activity timeline complete once final text starts streaming', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'thinking first' } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.TEXT,
+        text: 'final answer is streaming',
+      } as unknown as TMessageContentParts,
+    ];
+
+    render(
+      <ContentParts
+        {...baseProps}
+        content={content}
+        isLast
+        isSubmitting={true}
+        isLatestMessage={true}
+      />,
+    );
+
+    expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-submitting', 'false');
+    expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-last', 'false');
+    expect(screen.getByTestId(`real-part-${ContentTypes.TEXT}`)).toBeInTheDocument();
+  });
+
+  it('keeps the activity timeline live while thinking is still the latest part', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'thinking live' } as unknown as TMessageContentParts,
+    ];
+
+    render(
+      <ContentParts
+        {...baseProps}
+        content={content}
+        isLast
+        isSubmitting={true}
+        isLatestMessage={true}
+      />,
+    );
+
+    expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-submitting', 'true');
+    expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-last', 'true');
   });
 
   it('shows the loading dot instead of a timeline for placeholder thinking text', () => {

@@ -1,8 +1,19 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
-import { Check, ChevronDown, Copy, ExternalLink, FileText, Search, Wrench } from 'lucide-react';
+import {
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  Copy,
+  ExternalLink,
+  FileText,
+  Search,
+  Wrench,
+  X,
+} from 'lucide-react';
 import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type {
   Agents,
@@ -23,7 +34,12 @@ import store from '~/store';
 
 const MAX_SOURCE_ICONS = 4;
 const MAX_READ_LINKS = 4;
+const RAW_THOUGHT_WORD_LIMIT = 90;
+const ACTIVITY_PANEL_ANIMATION_MS = 300;
 const BOLD_HEADING_PATTERN = /\*\*([^*]+?)\*\*/g;
+const SENTENCE_BOUNDARY_PATTERN = /(\.["')\]]*)\s+(?=[^\p{L}\p{N}]*\p{Lu})/gu;
+
+type ThoughtMode = 'summarized' | 'raw';
 
 type RenderPart = (part: TMessageContentParts, idx: number, isLastPart: boolean) => ReactNode;
 
@@ -63,6 +79,18 @@ type ThoughtSection = {
   body: string;
 };
 
+type RawThoughtNodeData = {
+  text: string;
+  wordCount: number;
+  isComplete: boolean;
+};
+
+type ThoughtPreviewNode = {
+  key: string;
+  title?: string;
+  body: string;
+};
+
 function parseThoughtSections(text: string): ThoughtSection[] {
   const sections: ThoughtSection[] = [];
   let lastIndex = 0;
@@ -96,6 +124,135 @@ function parseThoughtSections(text: string): ThoughtSection[] {
   }
 
   return sections;
+}
+
+function detectThoughtMode(text: string): ThoughtMode | null {
+  const trimmed = text.trimStart();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith('**')) {
+    return 'summarized';
+  }
+  if (trimmed === '*') {
+    return null;
+  }
+  return 'raw';
+}
+
+function splitRawThoughtNodes(text: string): RawThoughtNodeData[] {
+  const normalizedText = text.trim().replace(/\s+/g, ' ');
+  if (!normalizedText) {
+    return [];
+  }
+
+  const sentenceUnits: string[] = [];
+  let unitStart = 0;
+  for (const match of normalizedText.matchAll(SENTENCE_BOUNDARY_PATTERN)) {
+    const boundaryEnd = (match.index ?? 0) + match[1].length;
+    sentenceUnits.push(normalizedText.slice(unitStart, boundaryEnd).trim());
+    unitStart = boundaryEnd + match[0].slice(match[1].length).length;
+  }
+  sentenceUnits.push(normalizedText.slice(unitStart).trim());
+
+  const chunks: RawThoughtNodeData[] = [];
+  let activeChunk = '';
+  let activeWordCount = 0;
+
+  const flushActiveChunk = () => {
+    if (!activeChunk) {
+      return;
+    }
+    const trimmedChunk = activeChunk.trim();
+    chunks.push({
+      text: trimmedChunk,
+      wordCount: activeWordCount,
+      isComplete: /\.["')\]]*$/.test(trimmedChunk),
+    });
+    activeChunk = '';
+    activeWordCount = 0;
+  };
+
+  for (const unit of sentenceUnits) {
+    if (!unit) {
+      continue;
+    }
+    const activeIsComplete = /\.["')\]]*$/.test(activeChunk.trim());
+    const unitStartsWithUppercase = /^[^\p{L}\p{N}]*\p{Lu}/u.test(unit);
+    if (
+      activeChunk &&
+      activeWordCount >= RAW_THOUGHT_WORD_LIMIT &&
+      activeIsComplete &&
+      unitStartsWithUppercase
+    ) {
+      flushActiveChunk();
+    }
+    activeChunk = activeChunk ? `${activeChunk} ${unit}` : unit;
+    activeWordCount += unit.match(/\S+/g)?.length ?? 0;
+  }
+
+  flushActiveChunk();
+  return chunks;
+}
+
+function splitRawThoughtText(text: string): string[] {
+  return splitRawThoughtNodes(text).map((node) => node.text);
+}
+
+function getInlinePreviewNode(
+  text: string,
+  mode: ThoughtMode,
+  isSubmitting: boolean,
+): ThoughtPreviewNode | null {
+  if (mode === 'summarized') {
+    const sections = parseThoughtSections(text);
+    if (sections.length === 0) {
+      return null;
+    }
+    if (!isSubmitting) {
+      const sectionIndex = sections.length - 1;
+      const section = sections[sectionIndex];
+      return { key: `summary-${sectionIndex}`, title: section.title, body: section.body };
+    }
+    if (sections.length > 1) {
+      const sectionIndex = sections.length - 2;
+      const section = sections[sectionIndex];
+      return { key: `summary-${sectionIndex}`, title: section.title, body: section.body };
+    }
+    const section = sections[0];
+    return section.title ? { key: 'summary-0-title', title: section.title, body: '' } : null;
+  }
+
+  const nodes = splitRawThoughtNodes(text);
+  if (nodes.length === 0) {
+    return null;
+  }
+  if (!isSubmitting) {
+    const nodeIndex = nodes.length - 1;
+    return { key: `raw-${nodeIndex}`, body: nodes[nodeIndex].text };
+  }
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const node = nodes[index];
+    if (node.isComplete && (index < nodes.length - 1 || node.wordCount >= RAW_THOUGHT_WORD_LIMIT)) {
+      return { key: `raw-${index}`, body: node.text };
+    }
+  }
+  return null;
+}
+
+function getStableSummarizedSections(text: string, isSubmitting: boolean): ThoughtSection[] {
+  const sections = parseThoughtSections(text);
+  if (!isSubmitting || sections.length === 0) {
+    return sections;
+  }
+
+  const lastIndex = sections.length - 1;
+  const stableSections = sections.slice(0, lastIndex);
+  const activeSection = sections[lastIndex];
+  if (activeSection.title) {
+    stableSections.push({ title: activeSection.title, body: '' });
+  }
+  return stableSections;
 }
 
 function getLatestThoughtTitle(text: string): string {
@@ -374,11 +531,23 @@ function ReadLinks({ sources }: { sources: ValidSource[] }) {
   );
 }
 
-function TimelineNode({ children, icon }: { children: ReactNode; icon?: ReactNode }) {
+function TimelineNode({
+  children,
+  icon,
+  forceLine = false,
+}: {
+  children: ReactNode;
+  icon?: ReactNode;
+  forceLine?: boolean;
+}) {
   return (
     <div className="group/timeline-node relative pb-4 pl-6 last:pb-0">
       <span
-        className="absolute bottom-0 left-2 top-6 border-l border-border-light group-last/timeline-node:hidden"
+        data-testid="timeline-node-line"
+        className={cn(
+          'absolute bottom-0 left-2 top-6 border-l border-border-light',
+          !forceLine && 'group-last/timeline-node:hidden',
+        )}
         aria-hidden="true"
       />
       <span className="absolute left-0 top-1 flex size-4 items-center justify-center text-text-secondary">
@@ -391,25 +560,75 @@ function TimelineNode({ children, icon }: { children: ReactNode; icon?: ReactNod
   );
 }
 
-function ThoughtItem({ text }: { text: string }) {
+function RawThoughtNode({ text, forceLine }: { text: string; forceLine: boolean }) {
+  return (
+    <TimelineNode forceLine={forceLine}>
+      <p className="whitespace-pre-wrap break-words font-normal text-[rgb(93,93,93)] dark:text-[rgb(175,175,175)]">
+        {text}
+      </p>
+    </TimelineNode>
+  );
+}
+
+function RawThoughtNodes({ text, forceLine }: { text: string; forceLine: boolean }) {
+  return (
+    <>
+      {splitRawThoughtText(text).map((chunk, index) => (
+        <RawThoughtNode key={`raw-thought-${index}`} text={chunk} forceLine={forceLine} />
+      ))}
+    </>
+  );
+}
+
+function ThoughtItem({
+  text,
+  mode,
+  forceLine,
+  isSubmitting,
+}: {
+  text: string;
+  mode: ThoughtMode;
+  forceLine: boolean;
+  isSubmitting: boolean;
+}) {
   if (!text) {
     return null;
   }
-  const sections = parseThoughtSections(text);
+  if (mode === 'raw') {
+    return <RawThoughtNodes text={text} forceLine={forceLine} />;
+  }
+
+  const sections = getStableSummarizedSections(text, isSubmitting);
   if (sections.length === 0) {
-    return null;
+    return <RawThoughtNodes text={text} forceLine={forceLine} />;
   }
 
   return (
     <>
-      {sections.map((section, index) => (
-        <TimelineNode key={`${section.title ?? 'thought'}-${index}`}>
-          {section.title && <p className="font-medium text-text-primary">{section.title}</p>}
-          {section.body && (
-            <p className={cn('whitespace-pre-wrap', section.title && 'mt-1')}>{section.body}</p>
-          )}
-        </TimelineNode>
-      ))}
+      {sections.flatMap((section, sectionIndex) => {
+        if (section.title) {
+          return (
+            <TimelineNode key={`${section.title}-${sectionIndex}`} forceLine={forceLine}>
+              <p className="font-medium text-[rgb(93,93,93)] dark:text-[rgb(175,175,175)]">
+                {section.title}
+              </p>
+              {section.body && (
+                <p className="mt-1 whitespace-pre-wrap font-normal text-[rgb(93,93,93)] dark:text-[rgb(175,175,175)]">
+                  {section.body}
+                </p>
+              )}
+            </TimelineNode>
+          );
+        }
+
+        return (
+          <RawThoughtNodes
+            key={`thought-${sectionIndex}`}
+            text={section.body}
+            forceLine={forceLine}
+          />
+        );
+      })}
     </>
   );
 }
@@ -455,14 +674,20 @@ function WebSearchItem({
 
   return (
     <>
-      <TimelineNode icon={<Search className="size-3.5" aria-hidden="true" />}>
+      <TimelineNode
+        icon={<Search className="size-3.5" aria-hidden="true" />}
+        forceLine={isSubmitting}
+      >
         <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
           <span>{foundLabel}</span>
           <SourceIcons sources={sources} />
         </span>
       </TimelineNode>
       {readSources.length > 0 && (
-        <TimelineNode icon={<FileText className="size-3.5" aria-hidden="true" />}>
+        <TimelineNode
+          icon={<FileText className="size-3.5" aria-hidden="true" />}
+          forceLine={isSubmitting}
+        >
           <span className="inline-flex min-w-0 flex-wrap items-center gap-2">
             <span>{localize('com_ui_read_n_pages', { 0: String(readSources.length) })}</span>
             <ReadLinks sources={readSources} />
@@ -505,7 +730,10 @@ function ToolItem({
     : localize('com_assistants_running_var', { 0: label });
 
   return (
-    <TimelineNode icon={<Wrench className="size-3.5" aria-hidden="true" />}>
+    <TimelineNode
+      icon={<Wrench className="size-3.5" aria-hidden="true" />}
+      forceLine={isSubmitting}
+    >
       <button
         type="button"
         onClick={() => setIsExpanded((prev) => !prev)}
@@ -525,6 +753,16 @@ function ToolItem({
           </div>
         </div>
       </div>
+    </TimelineNode>
+  );
+}
+
+function CompletionItem({ elapsedSeconds }: { elapsedSeconds: number }) {
+  const localize = useLocalize();
+  return (
+    <TimelineNode icon={<CheckCircle2 className="size-3.5" aria-hidden="true" />}>
+      <p>{localize('com_ui_thought_for_seconds', { 0: String(Math.max(1, elapsedSeconds)) })}</p>
+      <p className="mt-1 text-text-primary">{localize('com_ui_done')}</p>
     </TimelineNode>
   );
 }
@@ -560,6 +798,15 @@ function useLiveDuration(isSubmitting: boolean): number | null {
   return hadLiveSessionRef.current ? elapsedSeconds : null;
 }
 
+function useLockedThoughtMode(text: string): ThoughtMode {
+  const modeRef = useRef<ThoughtMode | null>(null);
+  const detectedMode = detectThoughtMode(text);
+  if (modeRef.current == null && detectedMode != null) {
+    modeRef.current = detectedMode;
+  }
+  return modeRef.current ?? 'raw';
+}
+
 function Timeline({
   parts,
   isSubmitting,
@@ -583,21 +830,43 @@ function Timeline({
     [parts],
   );
   const defaultExpanded =
-    isSubmitting || (hasThoughts && showThinking) || (hasTools && autoExpandTools);
+    !isSubmitting && isLast && ((hasThoughts && showThinking) || (hasTools && autoExpandTools));
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
+  const [isPanelMounted, setIsPanelMounted] = useState(defaultExpanded);
+  const [isPanelClosing, setIsPanelClosing] = useState(false);
   const [userOverride, setUserOverride] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
-  const { style, ref } = useExpandCollapse(isExpanded);
 
   useEffect(() => {
     if (isSubmitting) {
-      setIsExpanded(true);
+      return;
+    }
+    if (!userOverride && isLast && elapsedSeconds != null) {
       return;
     }
     if (!userOverride) {
       setIsExpanded(defaultExpanded);
     }
-  }, [defaultExpanded, hasTools, isSubmitting, userOverride]);
+  }, [defaultExpanded, elapsedSeconds, isLast, isSubmitting, userOverride]);
+
+  useEffect(() => {
+    if (isExpanded) {
+      setIsPanelMounted(true);
+      setIsPanelClosing(false);
+      return;
+    }
+    if (!isPanelMounted) {
+      return;
+    }
+
+    setIsPanelClosing(true);
+    const timeout = window.setTimeout(() => {
+      setIsPanelMounted(false);
+      setIsPanelClosing(false);
+    }, ACTIVITY_PANEL_ANIMATION_MS);
+
+    return () => window.clearTimeout(timeout);
+  }, [isExpanded, isPanelMounted]);
 
   const thoughtText = useMemo(
     () =>
@@ -607,11 +876,21 @@ function Timeline({
         .join('\n\n'),
     [parts],
   );
-  const activeThoughtTitle = useMemo(() => getLatestThoughtTitle(thoughtText), [thoughtText]);
+  const thoughtMode = useLockedThoughtMode(thoughtText);
+  const activeThoughtTitle = useMemo(
+    () => (thoughtMode === 'summarized' ? getLatestThoughtTitle(thoughtText) : ''),
+    [thoughtMode, thoughtText],
+  );
+  const previewNode = useMemo(
+    () => getInlinePreviewNode(thoughtText, thoughtMode, isSubmitting),
+    [isSubmitting, thoughtMode, thoughtText],
+  );
   const thinkingLabel = useMemo(
     () => stripTrailingEllipsis(localize('com_ui_thinking')),
     [localize],
   );
+  const activityLabel = localize('com_ui_activity');
+  const durationLabel = elapsedSeconds != null ? `${Math.max(1, elapsedSeconds)}s` : '';
 
   const handleCopy = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -631,6 +910,11 @@ function Timeline({
     setIsExpanded((prev) => !prev);
   }, []);
 
+  const handleClose = useCallback(() => {
+    setUserOverride(true);
+    setIsExpanded(false);
+  }, []);
+
   const label = useMemo(() => {
     if (isSubmitting) {
       return activeThoughtTitle || thinkingLabel;
@@ -640,29 +924,162 @@ function Timeline({
     }
     return localize('com_ui_thoughts');
   }, [activeThoughtTitle, elapsedSeconds, isSubmitting, localize, thinkingLabel]);
+  const showInlinePreview = !isExpanded && isSubmitting && !!thoughtText;
+  const showCompletionFooter = !isSubmitting && elapsedSeconds != null;
+  const inlinePreviewTitle =
+    thoughtMode === 'summarized' && previewNode?.title ? previewNode.title : thinkingLabel;
+  const inlinePreviewBody =
+    thoughtMode === 'summarized' && previewNode?.title ? previewNode.body : previewNode?.body;
+
+  const activityContent = (
+    <div className="mt-4">
+      <h2 className="mb-3 text-base font-normal leading-6 text-text-primary">{thinkingLabel}</h2>
+      <div>
+        {parts.map(({ part, idx }) => {
+          if (part.type === ContentTypes.THINK) {
+            return (
+              <ThoughtItem
+                key={`thought-${idx}`}
+                text={getReasoningText(part)}
+                mode={thoughtMode}
+                forceLine={isSubmitting}
+                isSubmitting={isSubmitting}
+              />
+            );
+          }
+          if (isWebSearchPart(part)) {
+            return (
+              <WebSearchItem
+                key={`web-${idx}`}
+                part={part}
+                isSubmitting={isSubmitting}
+                searchResults={searchResults}
+                getAttachments={getAttachments}
+              />
+            );
+          }
+          if (part.type === ContentTypes.TOOL_CALL) {
+            return (
+              <ToolItem
+                key={`tool-${idx}`}
+                part={part}
+                idx={idx}
+                isSubmitting={isSubmitting}
+                isLastPart={isLast && idx === lastContentIdx}
+                renderPart={renderPart}
+              />
+            );
+          }
+          return null;
+        })}
+        {showCompletionFooter && <CompletionItem elapsedSeconds={elapsedSeconds} />}
+      </div>
+    </div>
+  );
+
+  const activityPanel = isPanelMounted ? (
+    <>
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label={localize('com_ui_close')}
+        className={cn(
+          'fixed inset-0 z-[79] bg-black/40 transition-opacity duration-300 lg:hidden',
+          isPanelClosing && 'opacity-0',
+        )}
+        onClick={handleClose}
+      />
+      <aside
+        id={contentId}
+        role="dialog"
+        aria-label={activityLabel}
+        aria-modal="false"
+        className={cn(
+          'fixed inset-x-0 bottom-0 z-[80] flex max-h-[82dvh] flex-col rounded-t-2xl border border-border-light bg-white text-text-primary shadow-[0_-12px_48px_rgba(0,0,0,0.18)] duration-300 motion-safe:ease-out dark:bg-gray-800 lg:inset-y-0 lg:left-auto lg:right-0 lg:max-h-none lg:w-[384px] lg:rounded-none lg:border-y-0 lg:border-r-0 lg:shadow-xl',
+          isPanelClosing
+            ? 'motion-safe:animate-out motion-safe:slide-out-to-bottom lg:motion-safe:animate-slide-out-right'
+            : 'motion-safe:animate-in motion-safe:slide-in-from-bottom-full lg:motion-safe:animate-slide-in-right',
+        )}
+      >
+        <div className="flex justify-center pt-2 lg:hidden" aria-hidden="true">
+          <span className="h-1 w-12 rounded-full bg-border-medium" />
+        </div>
+        <div className="flex items-center justify-between border-b border-border-light px-5 py-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <h1 className="truncate text-lg font-normal leading-6 text-text-primary">
+              {activityLabel}
+            </h1>
+            {durationLabel && (
+              <span className="shrink-0 text-sm text-text-secondary">· {durationLabel}</span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={handleClose}
+            aria-label={localize('com_ui_close')}
+            className="rounded p-1 text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy"
+          >
+            <X className="size-5" aria-hidden="true" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">{activityContent}</div>
+      </aside>
+    </>
+  ) : null;
+  const portalTarget = typeof document === 'undefined' ? null : document.body;
 
   return (
     <section className="my-2" data-testid="activity-timeline">
-      <div className="group/timeline inline-flex max-w-full flex-col text-text-secondary">
+      <div className="group/timeline flex max-w-full flex-col text-text-secondary">
         <div className="flex max-w-full items-center gap-1.5">
-          <button
-            type="button"
-            onClick={handleToggle}
-            aria-expanded={isExpanded}
-            aria-controls={contentId}
-            className="inline-flex min-w-0 items-center gap-1.5 rounded text-base font-medium leading-7 transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy"
-          >
-            {isSubmitting ? (
-              <TextShimmer className="truncate">{label}</TextShimmer>
-            ) : (
-              <span className="truncate">{label}</span>
-            )}
-            <ChevronDown
-              className={cn('size-4 shrink-0 transition-transform', isExpanded && 'rotate-180')}
-              aria-hidden="true"
-            />
-          </button>
-          {thoughtText && (
+          {showInlinePreview ? (
+            <button
+              type="button"
+              onClick={handleToggle}
+              aria-expanded={isExpanded}
+              aria-controls={contentId}
+              className="flex w-full max-w-3xl items-start rounded-2xl border border-border-light bg-transparent px-4 py-3 text-left font-normal text-text-secondary transition-[border-color,color,transform] duration-300 ease-out hover:border-border-medium hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-bottom-1"
+            >
+              <span className="min-w-0">
+                <TextShimmer className="block text-base font-medium leading-6">
+                  {inlinePreviewTitle}
+                </TextShimmer>
+                {previewNode && (
+                  <span
+                    key={previewNode.key}
+                    data-testid="activity-preview-node"
+                    className="activity-preview-node-enter mt-2 block text-sm font-normal leading-5 text-[rgb(93,93,93)] dark:text-[rgb(175,175,175)]"
+                  >
+                    {thoughtMode !== 'summarized' && previewNode.title && (
+                      <span className="block whitespace-pre-wrap">{previewNode.title}</span>
+                    )}
+                    {inlinePreviewBody && (
+                      <span className="block whitespace-pre-wrap">{inlinePreviewBody}</span>
+                    )}
+                  </span>
+                )}
+              </span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleToggle}
+              aria-expanded={isExpanded}
+              aria-controls={contentId}
+              className="inline-flex min-w-0 items-center gap-1.5 rounded text-base font-normal leading-7 text-text-secondary transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy"
+            >
+              {isSubmitting ? (
+                <TextShimmer className="truncate font-medium">{label}</TextShimmer>
+              ) : (
+                <span className="truncate">{label}</span>
+              )}
+              <ChevronDown
+                className={cn('size-4 shrink-0 transition-transform', isExpanded && 'rotate-180')}
+                aria-hidden="true"
+              />
+            </button>
+          )}
+          {thoughtText && !showInlinePreview && (
             <button
               type="button"
               onClick={handleCopy}
@@ -681,47 +1098,8 @@ function Timeline({
             </button>
           )}
         </div>
-        <div
-          id={contentId}
-          role="group"
-          aria-label={label}
-          aria-hidden={!isExpanded || undefined}
-          style={style}
-        >
-          <div className="overflow-hidden" ref={ref}>
-            <div className="mt-2">
-              {parts.map(({ part, idx }) => {
-                if (part.type === ContentTypes.THINK) {
-                  return <ThoughtItem key={`thought-${idx}`} text={getReasoningText(part)} />;
-                }
-                if (isWebSearchPart(part)) {
-                  return (
-                    <WebSearchItem
-                      key={`web-${idx}`}
-                      part={part}
-                      isSubmitting={isSubmitting}
-                      searchResults={searchResults}
-                      getAttachments={getAttachments}
-                    />
-                  );
-                }
-                if (part.type === ContentTypes.TOOL_CALL) {
-                  return (
-                    <ToolItem
-                      key={`tool-${idx}`}
-                      part={part}
-                      idx={idx}
-                      isSubmitting={isSubmitting}
-                      isLastPart={isLast && idx === lastContentIdx}
-                      renderPart={renderPart}
-                    />
-                  );
-                }
-                return null;
-              })}
-            </div>
-          </div>
-        </div>
+        {activityPanel &&
+          (portalTarget ? createPortal(activityPanel, portalTarget) : activityPanel)}
       </div>
     </section>
   );

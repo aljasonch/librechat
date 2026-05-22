@@ -456,11 +456,13 @@ const ContentParts = memo(function ContentParts({
           return renderPart(part, idx, idx === lastContentIdx);
         }
         if (group.type === 'timeline') {
+          const isTimelineLive =
+            effectiveIsSubmitting && group.parts.some((p) => p.idx === lastContentIdx);
           return (
             <Timeline
               key={`timeline-${group.parts[0].idx}`}
               parts={group.parts}
-              isSubmitting={effectiveIsSubmitting}
+              isSubmitting={isTimelineLive}
               isLast={group.parts.some((p) => p.idx === lastContentIdx)}
               lastContentIdx={lastContentIdx}
               searchResults={searchResults}

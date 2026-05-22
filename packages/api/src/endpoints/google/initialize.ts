@@ -1,4 +1,5 @@
 import path from 'path';
+import fs from 'fs';
 import { EModelEndpoint, AuthKeys } from 'librechat-data-provider';
 import type {
   BaseInitializeParams,
@@ -44,11 +45,14 @@ export async function initializeGoogle({
   if (!isGoogleKeyProvided && loadServiceKey) {
     /** Only attempt to load service key if GOOGLE_KEY is not provided */
     try {
-      const serviceKeyPath =
-        process.env.GOOGLE_SERVICE_KEY_FILE || path.join(process.cwd(), 'api', 'data', 'auth.json');
-      const loadedKey = await loadServiceKey(serviceKeyPath);
-      if (loadedKey) {
-        serviceKey = loadedKey;
+      const configuredServiceKeyPath = process.env.GOOGLE_SERVICE_KEY_FILE?.trim();
+      const defaultServiceKeyPath = path.join(process.cwd(), 'api', 'data', 'auth.json');
+      const serviceKeyPath = configuredServiceKeyPath || defaultServiceKeyPath;
+      if (configuredServiceKeyPath || fs.existsSync(defaultServiceKeyPath)) {
+        const loadedKey = await loadServiceKey(serviceKeyPath);
+        if (loadedKey) {
+          serviceKey = loadedKey;
+        }
       }
     } catch {
       // Service key loading failed, but that's okay if not required
