@@ -68,6 +68,10 @@ const makeRawSentence = (firstWord: string, wordCount: number) =>
   ).join(' ')}.`;
 
 describe('Timeline', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
   it('renders compact thoughts plus found/read web rows', () => {
     const webPart = {
       type: ContentTypes.TOOL_CALL,
@@ -393,6 +397,32 @@ describe('Timeline', () => {
       expect(screen.getByText('Done')).toBeInTheDocument();
     });
     expect(screen.getAllByText(/Thought for 1 seconds/)).toHaveLength(2);
+  });
+
+  it('restores completed thought duration after a refresh', () => {
+    window.localStorage.setItem('librechat.activityTimeline.duration:c1:m1:0', '14');
+
+    renderTimeline({
+      parts: [
+        {
+          idx: 0,
+          part: {
+            type: ContentTypes.THINK,
+            think: 'Stored thought duration.',
+          } as unknown as TMessageContentParts,
+        },
+      ],
+      isSubmitting: false,
+      durationKey: 'c1:m1:0',
+    });
+
+    expect(screen.getByRole('button', { name: /Thought for 14 seconds/ })).toBeInTheDocument();
+
+    openActivity();
+
+    expect(screen.getByRole('dialog', { name: 'Activity' })).toBeInTheDocument();
+    expect(screen.getByText('Done')).toBeInTheDocument();
+    expect(screen.getAllByText(/Thought for 14 seconds/)).toHaveLength(2);
   });
 
   it('keeps raw thinking literal instead of rendering markdown', () => {

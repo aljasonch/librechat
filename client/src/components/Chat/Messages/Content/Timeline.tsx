@@ -36,6 +36,7 @@ const MAX_SOURCE_ICONS = 4;
 const MAX_READ_LINKS = 4;
 const RAW_THOUGHT_WORD_LIMIT = 90;
 const ACTIVITY_PANEL_ANIMATION_MS = 300;
+const ACTIVITY_DURATION_STORAGE_PREFIX = 'librechat.activityTimeline.duration';
 const BOLD_HEADING_PATTERN = /\*\*([^*]+?)\*\*/g;
 const SENTENCE_BOUNDARY_PATTERN = /(\.["')\]]*)\s+(?=[^\p{L}\p{N}]*\p{Lu})/gu;
 
@@ -49,6 +50,7 @@ type TimelineProps = {
   isLast: boolean;
   lastContentIdx: number;
   searchResults?: { [key: string]: SearchResultData };
+  durationKey?: string;
   getAttachments: (part: TMessageContentParts) => TAttachment[] | undefined;
   renderPart: RenderPart;
 };
@@ -767,10 +769,44 @@ function CompletionItem({ elapsedSeconds }: { elapsedSeconds: number }) {
   );
 }
 
-function useLiveDuration(isSubmitting: boolean): number | null {
+function getDurationStorageKey(durationKey?: string): string | null {
+  return durationKey ? `${ACTIVITY_DURATION_STORAGE_PREFIX}:${durationKey}` : null;
+}
+
+function readStoredDuration(durationKey?: string): number | null {
+  const storageKey = getDurationStorageKey(durationKey);
+  if (!storageKey || typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const parsedValue = Number(window.localStorage.getItem(storageKey));
+    return Number.isFinite(parsedValue) && parsedValue > 0 ? Math.round(parsedValue) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredDuration(durationKey: string | undefined, elapsedSeconds: number) {
+  const storageKey = getDurationStorageKey(durationKey);
+  if (!storageKey || typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(storageKey, String(Math.max(1, Math.round(elapsedSeconds))));
+  } catch {
+    // Storage can be unavailable in private or restricted browser contexts.
+  }
+}
+
+function useLiveDuration(isSubmitting: boolean, durationKey?: string): number | null {
+  const initialStoredDuration = readStoredDuration(durationKey);
   const startTimeRef = useRef<number | null>(isSubmitting ? Date.now() : null);
-  const hadLiveSessionRef = useRef(isSubmitting);
-  const [elapsedSeconds, setElapsedSeconds] = useState<number | null>(isSubmitting ? 0 : null);
+  const hadLiveSessionRef = useRef(isSubmitting || initialStoredDuration != null);
+  const [elapsedSeconds, setElapsedSeconds] = useState<number | null>(
+    isSubmitting ? 0 : initialStoredDuration,
+  );
 
   useEffect(() => {
     if (isSubmitting && startTimeRef.current == null) {
@@ -781,19 +817,35 @@ function useLiveDuration(isSubmitting: boolean): number | null {
 
     if (!isSubmitting) {
       if (hadLiveSessionRef.current && startTimeRef.current != null) {
-        setElapsedSeconds(Math.max(1, Math.round((Date.now() - startTimeRef.current) / 1000)));
+        const finalDuration = Math.max(1, Math.round((Date.now() - startTimeRef.current) / 1000));
+        writeStoredDuration(durationKey, finalDuration);
+        setElapsedSeconds(finalDuration);
+        startTimeRef.current = null;
+        return;
       }
+
+      const storedDuration = readStoredDuration(durationKey);
+      if (storedDuration != null) {
+        hadLiveSessionRef.current = true;
+        setElapsedSeconds(storedDuration);
+        return;
+      }
+      setElapsedSeconds(null);
       return;
     }
 
     const interval = window.setInterval(() => {
       if (startTimeRef.current != null) {
-        setElapsedSeconds(Math.round((Date.now() - startTimeRef.current) / 1000));
+        const nextDuration = Math.round((Date.now() - startTimeRef.current) / 1000);
+        setElapsedSeconds(nextDuration);
+        if (nextDuration > 0) {
+          writeStoredDuration(durationKey, nextDuration);
+        }
       }
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [isSubmitting]);
+  }, [durationKey, isSubmitting]);
 
   return hadLiveSessionRef.current ? elapsedSeconds : null;
 }
@@ -813,6 +865,7 @@ function Timeline({
   isLast,
   lastContentIdx,
   searchResults,
+  durationKey,
   getAttachments,
   renderPart,
 }: TimelineProps) {
@@ -820,7 +873,7 @@ function Timeline({
   const contentId = useId();
   const showThinking = useAtomValue(showThinkingAtom);
   const autoExpandTools = useRecoilValue(store.autoExpandTools);
-  const elapsedSeconds = useLiveDuration(isSubmitting);
+  const elapsedSeconds = useLiveDuration(isSubmitting, durationKey);
   const hasThoughts = useMemo(
     () => parts.some(({ part }) => getReasoningText(part).length > 0),
     [parts],

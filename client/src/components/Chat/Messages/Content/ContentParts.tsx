@@ -466,6 +466,7 @@ const ContentParts = memo(function ContentParts({
               isLast={group.parts.some((p) => p.idx === lastContentIdx)}
               lastContentIdx={lastContentIdx}
               searchResults={searchResults}
+              durationKey={`${conversationId ?? 'local'}:${messageId}:${group.parts[0].idx}`}
               getAttachments={(part) => attachmentMap[getToolCallId(part)]}
               renderPart={renderPart}
             />
