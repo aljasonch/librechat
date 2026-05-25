@@ -1,5 +1,5 @@
-import { memo, useMemo, useCallback } from 'react';
-import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
+import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
+import { Constants, ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type {
   TMessageContentParts,
   SearchResultData,
@@ -81,6 +81,16 @@ const getActivityDurations = (metadata: TMessage['metadata']): Record<string, nu
   }
   return durations;
 };
+
+const canPersistActivityDuration = (
+  conversationId: string | null | undefined,
+  messageId: string,
+): conversationId is string =>
+  !!conversationId &&
+  conversationId !== Constants.NEW_CONVO &&
+  conversationId !== Constants.PENDING_CONVO &&
+  !!messageId &&
+  !messageId.endsWith('_');
 
 type RenderUnit =
   | { type: 'single'; part: PartWithIndex }
@@ -201,20 +211,58 @@ const ContentParts = memo(function ContentParts({
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
   const { mutate: updateActivityDuration } = useUpdateMessageActivityDurationMutation();
   const activityDurations = useMemo(() => getActivityDurations(metadata), [metadata]);
+  const pendingActivityDurationsRef = useRef<Record<string, number>>({});
+  const sentActivityDurationIdsRef = useRef<Set<string>>(new Set());
   const persistActivityDuration = useCallback(
     (key: string, elapsedSeconds: number) => {
-      if (!conversationId) {
+      pendingActivityDurationsRef.current[key] = elapsedSeconds;
+      if (!canPersistActivityDuration(conversationId, messageId)) {
         return;
       }
-      updateActivityDuration({
-        key,
-        elapsedSeconds,
-        messageId,
-        conversationId,
-      });
+
+      const mutationId = `${conversationId}:${messageId}:${key}:${elapsedSeconds}`;
+      if (sentActivityDurationIdsRef.current.has(mutationId)) {
+        return;
+      }
+      sentActivityDurationIdsRef.current.add(mutationId);
+      updateActivityDuration(
+        {
+          key,
+          elapsedSeconds,
+          messageId,
+          conversationId,
+        },
+        {
+          onSuccess: () => {
+            delete pendingActivityDurationsRef.current[key];
+          },
+          onError: () => {
+            sentActivityDurationIdsRef.current.delete(mutationId);
+          },
+        },
+      );
     },
     [conversationId, messageId, updateActivityDuration],
   );
+
+  useEffect(() => {
+    for (const key of Object.keys(activityDurations)) {
+      delete pendingActivityDurationsRef.current[key];
+    }
+  }, [activityDurations]);
+
+  useEffect(() => {
+    if (!canPersistActivityDuration(conversationId, messageId)) {
+      return;
+    }
+
+    for (const [key, elapsedSeconds] of Object.entries(pendingActivityDurationsRef.current)) {
+      if (activityDurations[key] != null) {
+        continue;
+      }
+      persistActivityDuration(key, elapsedSeconds);
+    }
+  }, [activityDurations, conversationId, messageId, persistActivityDuration]);
 
   /**
    * Interim skill cards — rendered in a separate slot ABOVE the Parts

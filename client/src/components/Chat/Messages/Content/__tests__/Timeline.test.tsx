@@ -1,6 +1,6 @@
 import React from 'react';
 import { RecoilRoot } from 'recoil';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { createEvent, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type { TAttachment, TMessageContentParts } from 'librechat-data-provider';
 import Timeline from '../Timeline';
@@ -59,6 +59,19 @@ const renderTimeline = (
 
 const openActivity = () => {
   fireEvent.click(screen.getAllByRole('button')[0]);
+};
+
+const firePointerEvent = (
+  element: Element,
+  type: 'pointerDown' | 'pointerMove' | 'pointerUp',
+  init: { pointerId: number; clientY: number },
+) => {
+  const event = createEvent[type](element);
+  Object.defineProperties(event, {
+    clientY: { value: init.clientY },
+    pointerId: { value: init.pointerId },
+  });
+  fireEvent(element, event);
 };
 
 const makeRawSentence = (firstWord: string, wordCount: number) =>
@@ -352,12 +365,43 @@ describe('Timeline', () => {
     fireEvent.click(closeButtons[closeButtons.length - 1]);
 
     expect(screen.getByRole('dialog', { name: 'Activity' })).toHaveClass(
-      'lg:motion-safe:animate-slide-out-right',
+      'activity-panel-sheet-closing',
     );
     await waitFor(() => {
       expect(screen.queryByRole('dialog', { name: 'Activity' })).not.toBeInTheDocument();
     });
     expect(document.body).not.toHaveClass('activity-sidebar-open');
+  });
+
+  it('closes the mobile activity panel by dragging the sheet handle down', async () => {
+    renderTimeline({
+      parts: [
+        {
+          idx: 0,
+          part: {
+            type: ContentTypes.THINK,
+            think: 'Draggable panel.',
+          } as unknown as TMessageContentParts,
+        },
+      ],
+    });
+
+    openActivity();
+    const dialog = screen.getByRole('dialog', { name: 'Activity' });
+    const dragRegion = dialog.querySelector('.activity-panel-drag-region');
+    expect(dragRegion).toBeInTheDocument();
+
+    firePointerEvent(dragRegion as Element, 'pointerDown', { pointerId: 1, clientY: 10 });
+    firePointerEvent(dialog, 'pointerMove', { pointerId: 1, clientY: 150 });
+    expect(dialog).toHaveStyle({ '--activity-panel-drag-offset': '140px' });
+
+    firePointerEvent(dialog, 'pointerUp', { pointerId: 1, clientY: 150 });
+
+    expect(dialog).toHaveClass('activity-panel-sheet-closing');
+    expect(dialog).toHaveStyle({ '--activity-panel-drag-offset': '140px' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Activity' })).not.toBeInTheDocument();
+    });
   });
 
   it('closes the previously opened activity panel when another timeline opens', async () => {

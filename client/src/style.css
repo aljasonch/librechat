@@ -3022,7 +3022,82 @@ html {
   animation: activityPreviewNodeEnter 860ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+@keyframes activityPanelMobileIn {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes activityPanelMobileOut {
+  from {
+    transform: translateY(var(--activity-panel-drag-offset));
+  }
+  to {
+    transform: translateY(100%);
+  }
+}
+
+@keyframes activityPanelDesktopIn {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes activityPanelDesktopOut {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+.activity-panel-sheet {
+  --activity-panel-drag-offset: 0px;
+  transform: translateY(var(--activity-panel-drag-offset));
+  will-change: transform;
+}
+
+.activity-panel-sheet-open {
+  animation: activityPanelMobileIn 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.activity-panel-sheet-closing {
+  animation: activityPanelMobileOut 300ms cubic-bezier(0.4, 0, 1, 1) both;
+  pointer-events: none;
+}
+
+.activity-panel-sheet-dragging {
+  animation: none;
+  transform: translateY(var(--activity-panel-drag-offset));
+  transition: none;
+}
+
+.activity-panel-drag-region {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.activity-panel-sheet-dragging .activity-panel-drag-region {
+  cursor: grabbing;
+}
+
 @media (min-width: 1024px) {
+  .activity-panel-sheet-open {
+    animation-name: activityPanelDesktopIn;
+  }
+
+  .activity-panel-sheet-closing {
+    animation-name: activityPanelDesktopOut;
+  }
+
   #root {
     width: 100%;
     transition: width 300ms cubic-bezier(0.2, 0, 0, 1);
@@ -3112,6 +3187,22 @@ html {
 
   .activity-preview-node-enter {
     animation: none;
+  }
+
+  .activity-panel-sheet-open {
+    animation: none;
+  }
+
+  .activity-panel-sheet-closing {
+    animation: none;
+    opacity: 0;
+    transform: translateY(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) and (min-width: 1024px) {
+  .activity-panel-sheet-closing {
+    transform: translateX(100%);
   }
 }
 

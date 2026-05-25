@@ -260,12 +260,52 @@ describe('ContentParts — interim skill cards', () => {
 
     timeline.click();
 
-    expect(mockUpdateActivityDuration).toHaveBeenCalledWith({
-      key: '0',
-      elapsedSeconds: 12,
-      messageId: 'msg-1',
-      conversationId: 'conversation-1',
-    });
+    expect(mockUpdateActivityDuration).toHaveBeenCalledWith(
+      {
+        key: '0',
+        elapsedSeconds: 12,
+        messageId: 'msg-1',
+        conversationId: 'conversation-1',
+      },
+      expect.any(Object),
+    );
+  });
+
+  it('defers activity duration persistence until the message has a real conversation id', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'completed thought' } as unknown as TMessageContentParts,
+    ];
+
+    const { rerender } = render(
+      <ContentParts
+        {...baseProps}
+        content={content}
+        conversationId="new"
+        messageId="assistant-placeholder_"
+      />,
+    );
+
+    screen.getByTestId('activity-timeline').click();
+    expect(mockUpdateActivityDuration).not.toHaveBeenCalled();
+
+    rerender(
+      <ContentParts
+        {...baseProps}
+        content={content}
+        conversationId="conversation-1"
+        messageId="assistant-final"
+      />,
+    );
+
+    expect(mockUpdateActivityDuration).toHaveBeenCalledWith(
+      {
+        key: '0',
+        elapsedSeconds: 12,
+        messageId: 'assistant-final',
+        conversationId: 'conversation-1',
+      },
+      expect.any(Object),
+    );
   });
 
   it('shows the loading dot instead of a timeline for placeholder thinking text', () => {

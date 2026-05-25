@@ -1,5 +1,10 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { MouseEvent, ReactNode } from 'react';
+import type {
+  CSSProperties,
+  MouseEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
@@ -36,6 +41,7 @@ const MAX_SOURCE_ICONS = 4;
 const MAX_READ_LINKS = 4;
 const RAW_THOUGHT_WORD_LIMIT = 90;
 const ACTIVITY_PANEL_ANIMATION_MS = 300;
+const ACTIVITY_PANEL_DRAG_CLOSE_THRESHOLD = 96;
 const ACTIVITY_DURATION_STORAGE_PREFIX = 'librechat.activityTimeline.duration';
 const ACTIVITY_SIDEBAR_OPEN_CLASS = 'activity-sidebar-open';
 const ACTIVITY_TIMELINE_OPEN_EVENT = 'librechat:activity-timeline-open';
@@ -952,6 +958,10 @@ function Timeline({
   const [isPanelClosing, setIsPanelClosing] = useState(false);
   const [userOverride, setUserOverride] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
+  const [dragOffset, setDragOffset] = useState(0);
+  const [isDraggingPanel, setIsDraggingPanel] = useState(false);
+  const panelDragRef = useRef<{ pointerId: number; startY: number } | null>(null);
+  const dragOffsetRef = useRef(0);
 
   useEffect(() => {
     const handleTimelineOpen = (event: Event) => {
@@ -980,6 +990,8 @@ function Timeline({
 
   useEffect(() => {
     if (isExpanded) {
+      dragOffsetRef.current = 0;
+      setDragOffset(0);
       setIsPanelMounted(true);
       setIsPanelClosing(false);
       return;
@@ -992,6 +1004,8 @@ function Timeline({
     const timeout = window.setTimeout(() => {
       setIsPanelMounted(false);
       setIsPanelClosing(false);
+      dragOffsetRef.current = 0;
+      setDragOffset(0);
     }, ACTIVITY_PANEL_ANIMATION_MS);
 
     return () => window.clearTimeout(timeout);
@@ -1057,6 +1071,72 @@ function Timeline({
     setUserOverride(true);
     setIsExpanded(false);
   }, []);
+
+  const updateDragOffset = useCallback((nextOffset: number) => {
+    dragOffsetRef.current = nextOffset;
+    setDragOffset(nextOffset);
+  }, []);
+
+  const handlePanelPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    if (
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(min-width: 1024px)').matches
+    ) {
+      return;
+    }
+
+    const target = event.target as HTMLElement;
+    if (!target.closest('[data-activity-drag-region="true"]')) {
+      return;
+    }
+    if (target.closest('button,a,input,textarea,select')) {
+      return;
+    }
+
+    const pointerId = Number.isFinite(event.pointerId) ? event.pointerId : 0;
+    const startY = Number.isFinite(event.clientY) ? event.clientY : 0;
+    panelDragRef.current = { pointerId, startY };
+    dragOffsetRef.current = 0;
+    setDragOffset(0);
+    setIsDraggingPanel(true);
+    event.currentTarget.setPointerCapture?.(pointerId);
+  }, []);
+
+  const handlePanelPointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      const drag = panelDragRef.current;
+      if (!drag || drag.pointerId !== event.pointerId) {
+        return;
+      }
+
+      const clientY = Number.isFinite(event.clientY) ? event.clientY : drag.startY;
+      const nextOffset = Math.max(0, clientY - drag.startY);
+      updateDragOffset(nextOffset);
+      event.preventDefault();
+    },
+    [updateDragOffset],
+  );
+
+  const finishPanelDrag = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      const drag = panelDragRef.current;
+      if (!drag || drag.pointerId !== event.pointerId) {
+        return;
+      }
+
+      panelDragRef.current = null;
+      setIsDraggingPanel(false);
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+
+      if (dragOffsetRef.current >= ACTIVITY_PANEL_DRAG_CLOSE_THRESHOLD) {
+        handleClose();
+        return;
+      }
+
+      updateDragOffset(0);
+    },
+    [handleClose, updateDragOffset],
+  );
 
   const label = useMemo(() => {
     if (isSubmitting) {
@@ -1137,17 +1217,32 @@ function Timeline({
         role="dialog"
         aria-label={activityLabel}
         aria-modal="false"
+        onPointerDown={handlePanelPointerDown}
+        onPointerMove={handlePanelPointerMove}
+        onPointerUp={finishPanelDrag}
+        onPointerCancel={finishPanelDrag}
+        style={
+          {
+            '--activity-panel-drag-offset': `${dragOffset}px`,
+          } as CSSProperties
+        }
         className={cn(
-          'fixed inset-x-0 bottom-0 z-[80] flex max-h-[82dvh] flex-col rounded-t-2xl border border-border-light bg-white text-text-primary shadow-[0_-12px_48px_rgba(0,0,0,0.18)] duration-300 motion-safe:ease-out dark:bg-gray-800 lg:inset-y-0 lg:left-auto lg:right-0 lg:max-h-none lg:w-[384px] lg:rounded-none lg:border-y-0 lg:border-r-0 lg:shadow-xl',
-          isPanelClosing
-            ? 'motion-safe:animate-out motion-safe:slide-out-to-bottom lg:motion-safe:animate-slide-out-right'
-            : 'motion-safe:animate-in motion-safe:slide-in-from-bottom-full lg:motion-safe:animate-slide-in-right',
+          'activity-panel-sheet fixed inset-x-0 bottom-0 z-[80] flex max-h-[82dvh] flex-col rounded-t-2xl border border-border-light bg-white text-text-primary shadow-[0_-12px_48px_rgba(0,0,0,0.18)] dark:bg-gray-800 lg:inset-y-0 lg:left-auto lg:right-0 lg:max-h-none lg:w-[384px] lg:rounded-none lg:border-y-0 lg:border-r-0 lg:shadow-xl',
+          isPanelClosing ? 'activity-panel-sheet-closing' : 'activity-panel-sheet-open',
+          isDraggingPanel && 'activity-panel-sheet-dragging',
         )}
       >
-        <div className="flex justify-center pt-2 lg:hidden" aria-hidden="true">
+        <div
+          className="activity-panel-drag-region flex justify-center pt-2 lg:hidden"
+          data-activity-drag-region="true"
+          aria-hidden="true"
+        >
           <span className="h-1 w-12 rounded-full bg-border-medium" />
         </div>
-        <div className="flex items-center justify-between border-b border-border-light px-5 py-4">
+        <div
+          className="activity-panel-drag-region flex items-center justify-between border-b border-border-light px-5 py-4"
+          data-activity-drag-region="true"
+        >
           <div className="flex min-w-0 items-center gap-2">
             <h1 className="truncate text-lg font-normal leading-6 text-text-primary">
               {activityLabel}
