@@ -244,6 +244,15 @@ export type TUpdateMessageContent = {
   text: string;
 };
 
+export type TUpdateMessageActivityDurationRequest = {
+  conversationId: string;
+  messageId: string;
+  key: string;
+  elapsedSeconds: number;
+};
+
+export type TUpdateMessageActivityDurationResponse = TUpdateMessageActivityDurationRequest;
+
 export type TUpdateUserKeyRequest = {
   name: string;
   value: string;

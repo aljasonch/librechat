@@ -172,3 +172,58 @@ export const useBranchMessageMutation = (
 
   return useMutation(mutationOptions);
 };
+
+export const useUpdateMessageActivityDurationMutation = (): UseMutationResult<
+  t.TUpdateMessageActivityDurationResponse,
+  Error,
+  t.TUpdateMessageActivityDurationRequest,
+  unknown
+> => {
+  const queryClient = useQueryClient();
+
+  return useMutation(
+    (variables: t.TUpdateMessageActivityDurationRequest) =>
+      dataService.updateMessageActivityDuration(variables),
+    {
+      onSuccess: (data) => {
+        queryClient.setQueryData<t.TMessage[]>(
+          [QueryKeys.messages, data.conversationId],
+          (prev) => {
+            if (!prev) {
+              return prev;
+            }
+
+            const nextMessages = [...prev];
+            for (let i = nextMessages.length - 1; i >= 0; i--) {
+              if (nextMessages[i].messageId !== data.messageId) {
+                continue;
+              }
+
+              const metadata = nextMessages[i].metadata ?? {};
+              const activityDurations =
+                metadata.activityDurations != null &&
+                typeof metadata.activityDurations === 'object' &&
+                !Array.isArray(metadata.activityDurations)
+                  ? metadata.activityDurations
+                  : {};
+
+              nextMessages[i] = {
+                ...nextMessages[i],
+                metadata: {
+                  ...metadata,
+                  activityDurations: {
+                    ...activityDurations,
+                    [data.key]: data.elapsedSeconds,
+                  },
+                },
+              };
+              break;
+            }
+
+            return nextMessages;
+          },
+        );
+      },
+    },
+  );
+};

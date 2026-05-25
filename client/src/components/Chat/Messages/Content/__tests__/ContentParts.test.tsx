@@ -3,6 +3,12 @@ import { render, screen } from '@testing-library/react';
 import { ContentTypes, Tools, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessageContentParts } from 'librechat-data-provider';
 
+const mockUpdateActivityDuration = jest.fn();
+
+jest.mock('~/data-provider', () => ({
+  useUpdateMessageActivityDurationMutation: () => ({ mutate: mockUpdateActivityDuration }),
+}));
+
 jest.mock('~/utils', () => ({
   mapAttachments: () => ({}),
   groupSequentialToolCalls: (parts: Array<{ part: unknown; idx: number }>) =>
@@ -46,16 +52,23 @@ jest.mock('../Timeline', () => ({
     parts,
     isSubmitting,
     isLast,
+    storedDuration,
+    onDurationFinalized,
   }: {
     parts: Array<{ part: TMessageContentParts; idx: number }>;
     isSubmitting: boolean;
     isLast: boolean;
+    storedDuration?: number;
+    onDurationFinalized?: (elapsedSeconds: number) => void;
   }) => (
-    <div
+    <button
+      type="button"
       data-testid="activity-timeline"
       data-count={String(parts.length)}
       data-submitting={String(isSubmitting)}
       data-last={String(isLast)}
+      data-stored-duration={String(storedDuration ?? '')}
+      onClick={() => onDurationFinalized?.(12)}
     />
   ),
 }));
@@ -90,6 +103,10 @@ const baseProps = {
 };
 
 describe('ContentParts — interim skill cards', () => {
+  beforeEach(() => {
+    mockUpdateActivityDuration.mockClear();
+  });
+
   it('renders a PendingSkillCall per manual skill on assistant messages', () => {
     render(<ContentParts {...baseProps} manualSkills={['brand-guidelines', 'pptx']} />);
     const cards = screen.getAllByTestId('pending-skill-call');
@@ -222,6 +239,33 @@ describe('ContentParts — interim skill cards', () => {
 
     expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-submitting', 'true');
     expect(screen.getByTestId('activity-timeline')).toHaveAttribute('data-last', 'true');
+  });
+
+  it('passes stored activity duration metadata and persists finalized duration', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'completed thought' } as unknown as TMessageContentParts,
+    ];
+
+    render(
+      <ContentParts
+        {...baseProps}
+        content={content}
+        conversationId="conversation-1"
+        metadata={{ activityDurations: { 0: 14 } }}
+      />,
+    );
+
+    const timeline = screen.getByTestId('activity-timeline');
+    expect(timeline).toHaveAttribute('data-stored-duration', '14');
+
+    timeline.click();
+
+    expect(mockUpdateActivityDuration).toHaveBeenCalledWith({
+      key: '0',
+      elapsedSeconds: 12,
+      messageId: 'msg-1',
+      conversationId: 'conversation-1',
+    });
   });
 
   it('shows the loading dot instead of a timeline for placeholder thinking text', () => {

@@ -70,6 +70,8 @@ const makeRawSentence = (firstWord: string, wordCount: number) =>
 describe('Timeline', () => {
   beforeEach(() => {
     window.localStorage.clear();
+    document.body.classList.remove('activity-sidebar-open');
+    delete document.body.dataset.activitySidebarOpenCount;
   });
 
   it('renders compact thoughts plus found/read web rows', () => {
@@ -341,6 +343,10 @@ describe('Timeline', () => {
 
     openActivity();
     expect(screen.getByRole('dialog', { name: 'Activity' })).toHaveClass('dark:bg-gray-800');
+    expect(document.body).toHaveClass('activity-sidebar-open');
+    expect(
+      screen.getByRole('dialog', { name: 'Activity' }).querySelector('.activity-panel-scrollbar'),
+    ).toBeInTheDocument();
 
     const closeButtons = screen.getAllByRole('button', { name: 'Close' });
     fireEvent.click(closeButtons[closeButtons.length - 1]);
@@ -351,9 +357,64 @@ describe('Timeline', () => {
     await waitFor(() => {
       expect(screen.queryByRole('dialog', { name: 'Activity' })).not.toBeInTheDocument();
     });
+    expect(document.body).not.toHaveClass('activity-sidebar-open');
+  });
+
+  it('closes the previously opened activity panel when another timeline opens', async () => {
+    render(
+      <RecoilRoot>
+        <Timeline
+          parts={[
+            {
+              idx: 0,
+              part: {
+                type: ContentTypes.THINK,
+                think: 'First activity thought.',
+              } as unknown as TMessageContentParts,
+            },
+          ]}
+          isSubmitting={true}
+          isLast={true}
+          lastContentIdx={0}
+          searchResults={undefined}
+          getAttachments={() => undefined}
+          renderPart={() => null}
+        />
+        <Timeline
+          parts={[
+            {
+              idx: 0,
+              part: {
+                type: ContentTypes.THINK,
+                think: 'Second activity thought.',
+              } as unknown as TMessageContentParts,
+            },
+          ]}
+          isSubmitting={true}
+          isLast={true}
+          lastContentIdx={0}
+          searchResults={undefined}
+          getAttachments={() => undefined}
+          renderPart={() => null}
+        />
+      </RecoilRoot>,
+    );
+
+    const toggles = screen.getAllByRole('button', { name: /Thinking/ });
+    fireEvent.click(toggles[0]);
+    expect(screen.getByText('First activity thought.')).toBeInTheDocument();
+
+    fireEvent.click(toggles[1]);
+
+    await waitFor(() => {
+      expect(screen.getAllByRole('dialog', { name: 'Activity' })).toHaveLength(1);
+    });
+    expect(screen.queryByText('First activity thought.')).not.toBeInTheDocument();
+    expect(screen.getByText('Second activity thought.')).toBeInTheDocument();
   });
 
   it('shows done in the activity timeline after live thinking completes', async () => {
+    const onDurationFinalized = jest.fn();
     const parts = [
       {
         idx: 0,
@@ -373,6 +434,7 @@ describe('Timeline', () => {
           searchResults={undefined}
           getAttachments={() => undefined}
           renderPart={() => null}
+          onDurationFinalized={onDurationFinalized}
         />
       </RecoilRoot>,
     );
@@ -389,6 +451,7 @@ describe('Timeline', () => {
           searchResults={undefined}
           getAttachments={() => undefined}
           renderPart={() => null}
+          onDurationFinalized={onDurationFinalized}
         />
       </RecoilRoot>,
     );
@@ -397,6 +460,7 @@ describe('Timeline', () => {
       expect(screen.getByText('Done')).toBeInTheDocument();
     });
     expect(screen.getAllByText(/Thought for 1 seconds/)).toHaveLength(2);
+    expect(onDurationFinalized).toHaveBeenCalledWith(1);
   });
 
   it('restores completed thought duration after a refresh', () => {
@@ -423,6 +487,27 @@ describe('Timeline', () => {
     expect(screen.getByRole('dialog', { name: 'Activity' })).toBeInTheDocument();
     expect(screen.getByText('Done')).toBeInTheDocument();
     expect(screen.getAllByText(/Thought for 14 seconds/)).toHaveLength(2);
+  });
+
+  it('restores completed thought duration from persisted message metadata', () => {
+    window.localStorage.setItem('librechat.activityTimeline.duration:c1:m1:0', '8');
+
+    renderTimeline({
+      parts: [
+        {
+          idx: 0,
+          part: {
+            type: ContentTypes.THINK,
+            think: 'Mongo stored duration.',
+          } as unknown as TMessageContentParts,
+        },
+      ],
+      isSubmitting: false,
+      durationKey: 'c1:m1:0',
+      storedDuration: 14,
+    });
+
+    expect(screen.getByRole('button', { name: /Thought for 14 seconds/ })).toBeInTheDocument();
   });
 
   it('keeps raw thinking literal instead of rendering markdown', () => {

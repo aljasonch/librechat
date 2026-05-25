@@ -68,6 +68,11 @@ export const messagesArtifacts = (messageId: string) => `${messagesRoot}/artifac
 
 export const messagesBranch = () => `${messagesRoot}/branch`;
 
+export const messageActivityDuration = (conversationId: string, messageId: string) =>
+  `${messagesRoot}/${encodeURIComponent(conversationId)}/${encodeURIComponent(
+    messageId,
+  )}/activity-duration`;
+
 const shareRoot = `${BASE_URL}/api/share`;
 export const shareMessages = (shareId: string) => `${shareRoot}/${shareId}`;
 export const getSharedLink = (conversationId: string) => `${shareRoot}/link/${conversationId}`;

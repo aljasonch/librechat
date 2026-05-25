@@ -143,6 +143,7 @@ export default function Message(props: TMessageProps) {
                     searchResults={searchResults}
                     manualSkills={message.manualSkills}
                     messageId={message.messageId}
+                    metadata={message.metadata}
                     setSiblingIdx={setSiblingIdx}
                     isCreatedByUser={message.isCreatedByUser}
                     conversationId={conversation?.conversationId}

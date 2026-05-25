@@ -3022,6 +3022,87 @@ html {
   animation: activityPreviewNodeEnter 860ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+@media (min-width: 1024px) {
+  #root {
+    width: 100%;
+    transition: width 300ms cubic-bezier(0.2, 0, 0, 1);
+  }
+
+  body.activity-sidebar-open {
+    overflow-x: hidden;
+  }
+
+  body.activity-sidebar-open #root {
+    width: calc(100% - 384px);
+  }
+
+  body.activity-sidebar-open .scrollbar-gutter-stable {
+    scrollbar-color: rgba(95, 95, 95, 0.82) transparent;
+    scrollbar-width: thin;
+  }
+
+  body.activity-sidebar-open .scrollbar-gutter-stable::-webkit-scrollbar-thumb {
+    background-color: rgba(95, 95, 95, 0.82);
+  }
+
+  .dark body.activity-sidebar-open .scrollbar-gutter-stable {
+    scrollbar-color: rgba(180, 180, 180, 0.42) transparent;
+  }
+
+  .dark body.activity-sidebar-open .scrollbar-gutter-stable::-webkit-scrollbar-thumb {
+    background-color: rgba(180, 180, 180, 0.42);
+  }
+}
+
+.activity-panel-scrollbar {
+  scrollbar-color: rgba(95, 95, 95, 0.82) transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.activity-panel-scrollbar::-webkit-scrollbar {
+  width: 10px;
+}
+
+.activity-panel-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(95, 95, 95, 0.82);
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background-clip: content-box;
+}
+
+.activity-panel-scrollbar::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+.dark .activity-panel-scrollbar {
+  scrollbar-color: rgba(180, 180, 180, 0.42) transparent;
+}
+
+.dark .activity-panel-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(180, 180, 180, 0.42);
+}
+
+.activity-panel-scrollbar:hover,
+.activity-panel-scrollbar:focus-within {
+  scrollbar-color: rgba(95, 95, 95, 0.95) transparent;
+}
+
+.activity-panel-scrollbar:hover::-webkit-scrollbar-thumb,
+.activity-panel-scrollbar:focus-within::-webkit-scrollbar-thumb {
+  background-color: rgba(95, 95, 95, 0.95);
+}
+
+.dark .activity-panel-scrollbar:hover,
+.dark .activity-panel-scrollbar:focus-within {
+  scrollbar-color: rgba(220, 220, 220, 0.6) transparent;
+}
+
+.dark .activity-panel-scrollbar:hover::-webkit-scrollbar-thumb,
+.dark .activity-panel-scrollbar:focus-within::-webkit-scrollbar-thumb {
+  background-color: rgba(220, 220, 220, 0.6);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .thinking-shimmer {
     background: none;

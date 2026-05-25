@@ -4,11 +4,13 @@ import type {
   TMessageContentParts,
   SearchResultData,
   TAttachment,
+  TMessage,
   Agents,
 } from 'librechat-data-provider';
 import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
 import { mapAttachments, groupSequentialToolCalls } from '~/utils';
 import { MessageContext, SearchContext } from '~/Providers';
+import { useUpdateMessageActivityDurationMutation } from '~/data-provider';
 import { EditTextPart, EmptyText } from './Parts';
 import PendingSkillCall from './Parts/PendingSkillCall';
 import MemoryArtifacts from './MemoryArtifacts';
@@ -64,6 +66,21 @@ const isActivityPart = (part: TMessageContentParts): boolean =>
 
 const isTimelineAnchorPart = (part: TMessageContentParts): boolean =>
   hasRenderableReasoning(part) || getStandardToolCallName(part) === Tools.web_search;
+
+const getActivityDurations = (metadata: TMessage['metadata']): Record<string, number> => {
+  const rawDurations = metadata?.activityDurations;
+  if (rawDurations == null || typeof rawDurations !== 'object' || Array.isArray(rawDurations)) {
+    return {};
+  }
+
+  const durations: Record<string, number> = {};
+  for (const [key, value] of Object.entries(rawDurations)) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      durations[key] = Math.round(value);
+    }
+  }
+  return durations;
+};
 
 type RenderUnit =
   | { type: 'single'; part: PartWithIndex }
@@ -131,6 +148,7 @@ const PartWithContext = memo(function PartWithContext({
 type ContentPartsProps = {
   content: Array<TMessageContentParts | undefined> | undefined;
   messageId: string;
+  metadata?: TMessage['metadata'];
   /**
    * Skill names the user invoked manually via the `$` popover on this turn.
    * `createdHandler` seeds this on the assistant placeholder from
@@ -168,6 +186,7 @@ const ContentParts = memo(function ContentParts({
   content,
   manualSkills,
   messageId,
+  metadata,
   enterEdit,
   siblingIdx,
   attachments,
@@ -180,6 +199,22 @@ const ContentParts = memo(function ContentParts({
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
+  const { mutate: updateActivityDuration } = useUpdateMessageActivityDurationMutation();
+  const activityDurations = useMemo(() => getActivityDurations(metadata), [metadata]);
+  const persistActivityDuration = useCallback(
+    (key: string, elapsedSeconds: number) => {
+      if (!conversationId) {
+        return;
+      }
+      updateActivityDuration({
+        key,
+        elapsedSeconds,
+        messageId,
+        conversationId,
+      });
+    },
+    [conversationId, messageId, updateActivityDuration],
+  );
 
   /**
    * Interim skill cards — rendered in a separate slot ABOVE the Parts
@@ -458,6 +493,7 @@ const ContentParts = memo(function ContentParts({
         if (group.type === 'timeline') {
           const isTimelineLive =
             effectiveIsSubmitting && group.parts.some((p) => p.idx === lastContentIdx);
+          const activityDurationKey = String(group.parts[0].idx);
           return (
             <Timeline
               key={`timeline-${group.parts[0].idx}`}
@@ -466,7 +502,11 @@ const ContentParts = memo(function ContentParts({
               isLast={group.parts.some((p) => p.idx === lastContentIdx)}
               lastContentIdx={lastContentIdx}
               searchResults={searchResults}
-              durationKey={`${conversationId ?? 'local'}:${messageId}:${group.parts[0].idx}`}
+              durationKey={`${conversationId ?? 'local'}:${messageId}:${activityDurationKey}`}
+              storedDuration={activityDurations[activityDurationKey]}
+              onDurationFinalized={(elapsedSeconds) =>
+                persistActivityDuration(activityDurationKey, elapsedSeconds)
+              }
               getAttachments={(part) => attachmentMap[getToolCallId(part)]}
               renderPart={renderPart}
             />

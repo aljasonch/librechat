@@ -816,6 +816,20 @@ export function updateMessageContent(payload: t.TUpdateMessageContent): Promise<
   return request.put(endpoints.messages({ conversationId, messageId }), { text, index });
 }
 
+export function updateMessageActivityDuration(
+  payload: t.TUpdateMessageActivityDurationRequest,
+): Promise<t.TUpdateMessageActivityDurationResponse> {
+  const { conversationId, messageId, key, elapsedSeconds } = payload;
+  if (!conversationId) {
+    throw new Error('conversationId is required');
+  }
+
+  return request.put(endpoints.messageActivityDuration(conversationId, messageId), {
+    key,
+    elapsedSeconds,
+  });
+}
+
 export const editArtifact = async ({
   messageId,
   ...params

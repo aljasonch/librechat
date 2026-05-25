@@ -37,6 +37,8 @@ const MAX_READ_LINKS = 4;
 const RAW_THOUGHT_WORD_LIMIT = 90;
 const ACTIVITY_PANEL_ANIMATION_MS = 300;
 const ACTIVITY_DURATION_STORAGE_PREFIX = 'librechat.activityTimeline.duration';
+const ACTIVITY_SIDEBAR_OPEN_CLASS = 'activity-sidebar-open';
+const ACTIVITY_TIMELINE_OPEN_EVENT = 'librechat:activity-timeline-open';
 const BOLD_HEADING_PATTERN = /\*\*([^*]+?)\*\*/g;
 const SENTENCE_BOUNDARY_PATTERN = /(\.["')\]]*)\s+(?=[^\p{L}\p{N}]*\p{Lu})/gu;
 
@@ -51,6 +53,8 @@ type TimelineProps = {
   lastContentIdx: number;
   searchResults?: { [key: string]: SearchResultData };
   durationKey?: string;
+  storedDuration?: number;
+  onDurationFinalized?: (elapsedSeconds: number) => void;
   getAttachments: (part: TMessageContentParts) => TAttachment[] | undefined;
   renderPart: RenderPart;
 };
@@ -800,13 +804,61 @@ function writeStoredDuration(durationKey: string | undefined, elapsedSeconds: nu
   }
 }
 
-function useLiveDuration(isSubmitting: boolean, durationKey?: string): number | null {
-  const initialStoredDuration = readStoredDuration(durationKey);
+function addActivitySidebarLayoutOffset(): () => void {
+  const body = typeof document === 'undefined' ? null : document.body;
+  if (!body) {
+    return () => undefined;
+  }
+
+  const openCount = Number(body.dataset.activitySidebarOpenCount ?? '0') + 1;
+  body.dataset.activitySidebarOpenCount = String(openCount);
+  body.classList.add(ACTIVITY_SIDEBAR_OPEN_CLASS);
+
+  return () => {
+    const nextOpenCount = Math.max(0, Number(body.dataset.activitySidebarOpenCount ?? '1') - 1);
+    if (nextOpenCount > 0) {
+      body.dataset.activitySidebarOpenCount = String(nextOpenCount);
+      return;
+    }
+
+    delete body.dataset.activitySidebarOpenCount;
+    body.classList.remove(ACTIVITY_SIDEBAR_OPEN_CLASS);
+  };
+}
+
+function announceActivityTimelineOpen(id: string): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.dispatchEvent(new CustomEvent(ACTIVITY_TIMELINE_OPEN_EVENT, { detail: { id } }));
+}
+
+function useLiveDuration(
+  isSubmitting: boolean,
+  durationKey?: string,
+  storedDuration?: number,
+  onDurationFinalized?: (elapsedSeconds: number) => void,
+): number | null {
+  const initialStoredDuration = storedDuration ?? readStoredDuration(durationKey);
   const startTimeRef = useRef<number | null>(isSubmitting ? Date.now() : null);
   const hadLiveSessionRef = useRef(isSubmitting || initialStoredDuration != null);
+  const onDurationFinalizedRef = useRef(onDurationFinalized);
+  const lastPersistedDurationRef = useRef<number | null>(storedDuration ?? null);
   const [elapsedSeconds, setElapsedSeconds] = useState<number | null>(
     isSubmitting ? 0 : initialStoredDuration,
   );
+
+  useEffect(() => {
+    onDurationFinalizedRef.current = onDurationFinalized;
+  }, [onDurationFinalized]);
+
+  useEffect(() => {
+    if (storedDuration != null) {
+      hadLiveSessionRef.current = true;
+      lastPersistedDurationRef.current = storedDuration;
+      setElapsedSeconds(storedDuration);
+    }
+  }, [storedDuration]);
 
   useEffect(() => {
     if (isSubmitting && startTimeRef.current == null) {
@@ -819,15 +871,19 @@ function useLiveDuration(isSubmitting: boolean, durationKey?: string): number | 
       if (hadLiveSessionRef.current && startTimeRef.current != null) {
         const finalDuration = Math.max(1, Math.round((Date.now() - startTimeRef.current) / 1000));
         writeStoredDuration(durationKey, finalDuration);
+        if (lastPersistedDurationRef.current !== finalDuration) {
+          lastPersistedDurationRef.current = finalDuration;
+          onDurationFinalizedRef.current?.(finalDuration);
+        }
         setElapsedSeconds(finalDuration);
         startTimeRef.current = null;
         return;
       }
 
-      const storedDuration = readStoredDuration(durationKey);
-      if (storedDuration != null) {
+      const latestStoredDuration = storedDuration ?? readStoredDuration(durationKey);
+      if (latestStoredDuration != null) {
         hadLiveSessionRef.current = true;
-        setElapsedSeconds(storedDuration);
+        setElapsedSeconds(latestStoredDuration);
         return;
       }
       setElapsedSeconds(null);
@@ -845,7 +901,7 @@ function useLiveDuration(isSubmitting: boolean, durationKey?: string): number | 
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [durationKey, isSubmitting]);
+  }, [durationKey, isSubmitting, storedDuration]);
 
   return hadLiveSessionRef.current ? elapsedSeconds : null;
 }
@@ -866,6 +922,8 @@ function Timeline({
   lastContentIdx,
   searchResults,
   durationKey,
+  storedDuration,
+  onDurationFinalized,
   getAttachments,
   renderPart,
 }: TimelineProps) {
@@ -873,7 +931,12 @@ function Timeline({
   const contentId = useId();
   const showThinking = useAtomValue(showThinkingAtom);
   const autoExpandTools = useRecoilValue(store.autoExpandTools);
-  const elapsedSeconds = useLiveDuration(isSubmitting, durationKey);
+  const elapsedSeconds = useLiveDuration(
+    isSubmitting,
+    durationKey,
+    storedDuration,
+    onDurationFinalized,
+  );
   const hasThoughts = useMemo(
     () => parts.some(({ part }) => getReasoningText(part).length > 0),
     [parts],
@@ -889,6 +952,19 @@ function Timeline({
   const [isPanelClosing, setIsPanelClosing] = useState(false);
   const [userOverride, setUserOverride] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
+
+  useEffect(() => {
+    const handleTimelineOpen = (event: Event) => {
+      const detail = (event as CustomEvent<{ id?: string }>).detail;
+      if (!detail?.id || detail.id === contentId) {
+        return;
+      }
+      setIsExpanded(false);
+    };
+
+    window.addEventListener(ACTIVITY_TIMELINE_OPEN_EVENT, handleTimelineOpen);
+    return () => window.removeEventListener(ACTIVITY_TIMELINE_OPEN_EVENT, handleTimelineOpen);
+  }, [contentId]);
 
   useEffect(() => {
     if (isSubmitting) {
@@ -920,6 +996,14 @@ function Timeline({
 
     return () => window.clearTimeout(timeout);
   }, [isExpanded, isPanelMounted]);
+
+  useEffect(() => {
+    if (!isPanelMounted) {
+      return;
+    }
+
+    return addActivitySidebarLayoutOffset();
+  }, [isPanelMounted]);
 
   const thoughtText = useMemo(
     () =>
@@ -960,8 +1044,14 @@ function Timeline({
 
   const handleToggle = useCallback(() => {
     setUserOverride(true);
-    setIsExpanded((prev) => !prev);
-  }, []);
+    setIsExpanded((prev) => {
+      const nextExpanded = !prev;
+      if (nextExpanded) {
+        announceActivityTimelineOpen(contentId);
+      }
+      return nextExpanded;
+    });
+  }, [contentId]);
 
   const handleClose = useCallback(() => {
     setUserOverride(true);
@@ -1075,7 +1165,9 @@ function Timeline({
             <X className="size-5" aria-hidden="true" />
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">{activityContent}</div>
+        <div className="activity-panel-scrollbar min-h-0 flex-1 overflow-y-auto px-5 pb-5">
+          {activityContent}
+        </div>
       </aside>
     </>
   ) : null;

@@ -318,6 +318,60 @@ router.get('/:conversationId/:messageId', validateMessageReq, async (req, res) =
   }
 });
 
+router.put(
+  '/:conversationId/:messageId/activity-duration',
+  validateMessageReq,
+  async (req, res) => {
+    try {
+      const { conversationId, messageId } = req.params;
+      const { key, elapsedSeconds } = req.body;
+      const durationKey = typeof key === 'string' ? key.trim() : '';
+      const seconds = Number(elapsedSeconds);
+
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(durationKey)) {
+        return res.status(400).json({ error: 'Invalid duration key' });
+      }
+
+      if (!Number.isInteger(seconds) || seconds < 1 || seconds > 86400) {
+        return res.status(400).json({ error: 'Invalid elapsed seconds' });
+      }
+
+      const message = (
+        await db.getMessages({ conversationId, messageId, user: req.user.id }, 'isCreatedByUser')
+      )?.[0];
+
+      if (!message) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      if (message.isCreatedByUser) {
+        return res.status(400).json({ error: 'Cannot update user message activity' });
+      }
+
+      await db.updateMessage(
+        req?.user?.id,
+        {
+          messageId,
+          $set: {
+            [`metadata.activityDurations.${durationKey}`]: seconds,
+          },
+        },
+        { context: 'updateActivityDuration' },
+      );
+
+      res.status(200).json({
+        conversationId,
+        messageId,
+        key: durationKey,
+        elapsedSeconds: seconds,
+      });
+    } catch (error) {
+      logger.error('Error updating message activity duration:', error);
+      res.status(500).json({ error: 'Failed to update activity duration' });
+    }
+  },
+);
+
 router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) => {
   try {
     const { conversationId, messageId } = req.params;
