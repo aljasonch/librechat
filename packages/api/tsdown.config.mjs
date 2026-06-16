@@ -1,7 +1,8 @@
+import path from 'node:path';
 import { defineConfig } from 'tsdown';
 
 const isFirstPartyImport = (id) =>
-  id.startsWith('.') || id.startsWith('~') || id.startsWith('/') || /^[A-Za-z]:[\\/]/.test(id);
+  id.startsWith('.') || id.startsWith('~') || path.isAbsolute(id) || /^[A-Za-z]:[\\/]/.test(id);
 
 export default defineConfig({
   // The telemetry entry is a thin shim (`src/telemetry.ts`) rather than the

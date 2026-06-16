@@ -15,8 +15,8 @@ import { Citation, CompositeCitation, HighlightedText } from '~/components/Web/C
 import { Artifact, artifactPlugin } from '~/components/Artifacts/Artifact';
 import { code, a, p, img, table } from './MarkdownComponents';
 import { rehypeStreamingWords, StreamingSpan } from './streaming';
+import { langSubset, remarkApproxTilde } from '~/utils';
 import { unicodeCitation } from '~/components/Web';
-import { langSubset } from '~/utils';
 
 /**
  * Single source of truth for the markdown rendering pipeline, shared by the
@@ -39,6 +39,7 @@ let markdownComponentsCache: { [nodeType: string]: ElementType } | null = null;
 export const getRemarkPlugins = (): PluggableList => {
   if (remarkPluginsCache === null) {
     remarkPluginsCache = [
+      remarkApproxTilde,
       supersub,
       remarkGfm,
       remarkDirective,

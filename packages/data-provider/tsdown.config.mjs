@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { createRequire } from 'node:module';
 import replace from '@rollup/plugin-replace';
 import { defineConfig } from 'tsdown';
@@ -5,7 +6,7 @@ import { defineConfig } from 'tsdown';
 const require = createRequire(import.meta.url);
 const rootPkg = require('../../package.json');
 const isFirstPartyImport = (id) =>
-  id.startsWith('.') || id.startsWith('/') || id.startsWith('src/') || /^[A-Za-z]:[\\/]/.test(id);
+  id.startsWith('.') || path.isAbsolute(id) || id.startsWith('src/') || /^[A-Za-z]:[\\/]/.test(id);
 
 export default defineConfig({
   entry: ['src/index.ts', 'src/react-query/index.ts'],

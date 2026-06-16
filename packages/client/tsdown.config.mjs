@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { defineConfig } from 'tsdown';
 
 // Mirror the prior Rollup `@rollup/plugin-replace` substitutions: only these three are
@@ -10,7 +11,7 @@ const define = {
 };
 
 const isFirstPartyImport = (id) =>
-  id.startsWith('.') || id.startsWith('~') || id.startsWith('/') || /^[A-Za-z]:[\\/]/.test(id);
+  id.startsWith('.') || id.startsWith('~') || path.isAbsolute(id) || /^[A-Za-z]:[\\/]/.test(id);
 
 export default defineConfig({
   entry: ['src/index.ts'],

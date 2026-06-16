@@ -7,15 +7,16 @@ import type {
   TMessage,
   Agents,
 } from 'librechat-data-provider';
+import type { ToolCallGroupExpansionState } from './ToolCallGroup';
 import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
 import { mapAttachments, groupSequentialToolCalls } from '~/utils';
 import { MessageContext, SearchContext } from '~/Providers';
 import { useUpdateMessageActivityDurationMutation } from '~/data-provider';
 import { EditTextPart, EmptyText } from './Parts';
 import PendingSkillCall from './Parts/PendingSkillCall';
+import { EditTextPart, EmptyText } from './Parts';
 import MemoryArtifacts from './MemoryArtifacts';
 import ToolCallGroup from './ToolCallGroup';
-import type { ToolCallGroupExpansionState } from './ToolCallGroup';
 import Container from './Container';
 import Timeline from './Timeline';
 import Part from './Part';
@@ -184,6 +185,8 @@ type ContentPartsProps = {
    * the full message object) so `React.memo` stays shallow-happy.
    */
   manualSkills?: string[];
+  /** ISO timestamp of the parent message, surfaced in parallel column headers. */
+  createdAt?: string | null;
   conversationId?: string | null;
   attachments?: TAttachment[];
   searchResults?: { [key: string]: SearchResultData };
@@ -222,6 +225,7 @@ const ContentParts = memo(function ContentParts({
   conversationId,
   isCreatedByUser,
   isLatestMessage,
+  createdAt,
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
@@ -553,6 +557,7 @@ const ContentParts = memo(function ContentParts({
         <ParallelContentRenderer
           content={content}
           messageId={messageId}
+          createdAt={createdAt}
           conversationId={conversationId}
           attachments={attachments}
           searchResults={searchResults}
