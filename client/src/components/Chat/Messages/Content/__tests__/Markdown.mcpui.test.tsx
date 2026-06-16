@@ -1,6 +1,7 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
 import Markdown from '../Markdown';
+import MarkdownLite from '../MarkdownLite';
 import { RecoilRoot } from 'recoil';
 import { UI_RESOURCE_MARKER } from '~/components/MCPUIResource/plugin';
 import {
@@ -171,5 +172,37 @@ describe('Markdown streaming word animation', () => {
 
     expect(animatedWords).toEqual(['A', 'word', 'before']);
     expect(container.querySelector('code')?.textContent).toContain('const value');
+  });
+});
+
+describe('Markdown table rendering', () => {
+  const tableMarkdown = [
+    '| Alpha | Bravo | Charlie | Delta | Echo | Foxtrot | Golf | Hotel |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
+    '| one | two | three | four | five | six | seven | eight |',
+  ].join('\n');
+
+  it('wraps GFM tables in a horizontally scrollable container', () => {
+    render(
+      <RecoilRoot>
+        <Markdown content={tableMarkdown} isLatestMessage={false} />
+      </RecoilRoot>,
+    );
+
+    expect(screen.getByRole('table').parentElement).toHaveClass(
+      'markdown-table-wrapper',
+      'w-full',
+      'max-w-full',
+    );
+  });
+
+  it('wraps lightweight Markdown tables in a horizontally scrollable container', () => {
+    render(<MarkdownLite content={tableMarkdown} />);
+
+    expect(screen.getByRole('table').parentElement).toHaveClass(
+      'markdown-table-wrapper',
+      'w-full',
+      'max-w-full',
+    );
   });
 });

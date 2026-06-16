@@ -1,0 +1,23 @@
+import { defineConfig } from 'tsdown';
+
+const isFirstPartyImport = (id) =>
+  id.startsWith('.') || id.startsWith('~') || id.startsWith('/') || /^[A-Za-z]:[\\/]/.test(id);
+
+export default defineConfig({
+  // The telemetry entry is a thin shim (`src/telemetry.ts`) rather than the
+  // `src/telemetry/index.ts` barrel: oxc emits declarations flat into outDir keyed
+  // by source basename, so two `index.ts` entries would collide (index.d.cts +
+  // index2.d.cts). Distinct basenames yield stable `index.*` / `telemetry.*` output.
+  entry: ['src/index.ts', 'src/telemetry.ts'],
+  format: ['cjs'],
+  platform: 'node',
+  dts: { oxc: true },
+  outDir: 'dist',
+  sourcemap: true,
+  // Externalize every third-party dependency (consumers provide the peers) and bundle
+  // only first-party code: relative imports and the `~/*` tsconfig alias (-> src).
+  // `neverBundle` is the 0.22 replacement for the deprecated `external` option.
+  deps: {
+    neverBundle: (id) => !isFirstPartyImport(id),
+  },
+});

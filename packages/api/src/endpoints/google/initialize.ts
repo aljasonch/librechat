@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import { Providers } from '@librechat/agents';
 import { EModelEndpoint, AuthKeys } from 'librechat-data-provider';
 import type {
   BaseInitializeParams,
@@ -24,14 +25,15 @@ export async function initializeGoogle({
   model_parameters,
   db,
 }: BaseInitializeParams): Promise<InitializeResultBase> {
-  void endpoint;
   const appConfig = req.config;
   const { GOOGLE_KEY, GOOGLE_REVERSE_PROXY, GOOGLE_AUTH_HEADER, PROXY } = process.env;
   const isUserProvided = GOOGLE_KEY === 'user_provided';
+  const isVertexEndpoint = endpoint === Providers.VERTEXAI;
+  const useUserProvidedGoogleKey = !isVertexEndpoint && isUserProvided;
   const { key: expiresAt } = req.body;
 
   let userKey = null;
-  if (expiresAt && isUserProvided) {
+  if (expiresAt && useUserProvidedGoogleKey) {
     checkUserKeyExpiry(expiresAt, EModelEndpoint.google);
     userKey = await db.getUserKey({ userId: req.user?.id ?? '', name: EModelEndpoint.google });
   }
@@ -40,9 +42,10 @@ export async function initializeGoogle({
 
   /** Check if GOOGLE_KEY is provided at all (including 'user_provided') */
   const isGoogleKeyProvided =
-    (GOOGLE_KEY && GOOGLE_KEY.trim() !== '') || (isUserProvided && userKey != null);
+    !isVertexEndpoint &&
+    ((GOOGLE_KEY && GOOGLE_KEY.trim() !== '') || (useUserProvidedGoogleKey && userKey != null));
 
-  if (!isGoogleKeyProvided && loadServiceKey) {
+  if ((isVertexEndpoint || !isGoogleKeyProvided) && loadServiceKey) {
     /** Only attempt to load service key if GOOGLE_KEY is not provided */
     try {
       const configuredServiceKeyPath = process.env.GOOGLE_SERVICE_KEY_FILE?.trim();
@@ -60,11 +63,11 @@ export async function initializeGoogle({
     }
   }
 
-  const credentials: GoogleCredentials = isUserProvided
+  const credentials: GoogleCredentials = useUserProvidedGoogleKey
     ? (userKey as GoogleCredentials)
     : {
         [AuthKeys.GOOGLE_SERVICE_KEY]: serviceKey,
-        [AuthKeys.GOOGLE_API_KEY]: GOOGLE_KEY,
+        ...(!isVertexEndpoint && { [AuthKeys.GOOGLE_API_KEY]: GOOGLE_KEY }),
       };
 
   let clientOptions: GoogleConfigOptions = {};
@@ -88,6 +91,13 @@ export async function initializeGoogle({
     authHeader: isEnabled(GOOGLE_AUTH_HEADER) ?? undefined,
     proxy: PROXY ?? undefined,
     modelOptions: model_parameters ?? {},
+    forceVertex: isVertexEndpoint,
+    projectId: isVertexEndpoint
+      ? (process.env.VERTEX_PROJECT_ID ??
+        process.env.GOOGLE_CLOUD_PROJECT ??
+        process.env.GCLOUD_PROJECT ??
+        process.env.GOOGLE_PROJECT_ID)
+      : undefined,
     ...clientOptions,
   };
 

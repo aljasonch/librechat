@@ -15,6 +15,7 @@ import { EditTextPart, EmptyText } from './Parts';
 import PendingSkillCall from './Parts/PendingSkillCall';
 import MemoryArtifacts from './MemoryArtifacts';
 import ToolCallGroup from './ToolCallGroup';
+import type { ToolCallGroupExpansionState } from './ToolCallGroup';
 import Container from './Container';
 import Timeline from './Timeline';
 import Part from './Part';
@@ -92,9 +93,21 @@ const canPersistActivityDuration = (
   !!messageId &&
   !messageId.endsWith('_');
 
+const getToolGroupId = (parts: PartWithIndex[], fallbackScope: number): string => {
+  const firstPart = parts[0];
+  if (!firstPart) {
+    return 'empty';
+  }
+  const toolCallId = getToolCallId(firstPart.part);
+  if (toolCallId) {
+    return `tool:${toolCallId}`;
+  }
+  return `fallback:${fallbackScope}:${firstPart.idx}`;
+};
+
 type RenderUnit =
   | { type: 'single'; part: PartWithIndex }
-  | { type: 'tool-group'; parts: PartWithIndex[]; groupAttachments: TAttachment[] }
+  | { type: 'tool-group'; parts: PartWithIndex[]; groupId: string; groupAttachments: TAttachment[] }
   | { type: 'timeline'; parts: PartWithIndex[] };
 
 type PartWithContextProps = {
@@ -110,6 +123,7 @@ type PartWithContextProps = {
   isLast: boolean;
   partAttachments: TAttachment[] | undefined;
   hideAttachments?: boolean;
+  onToolExpand?: () => void;
 };
 
 const PartWithContext = memo(function PartWithContext({
@@ -125,6 +139,7 @@ const PartWithContext = memo(function PartWithContext({
   isLast,
   partAttachments,
   hideAttachments,
+  onToolExpand,
 }: PartWithContextProps) {
   const contextValue = useMemo(
     () => ({
@@ -150,6 +165,7 @@ const PartWithContext = memo(function PartWithContext({
         isLast={isLastPart}
         showCursor={isLastPart && isLast}
         hideAttachments={hideAttachments}
+        onToolExpand={onToolExpand}
       />
     </MessageContext.Provider>
   );
@@ -263,6 +279,27 @@ const ContentParts = memo(function ContentParts({
       persistActivityDuration(key, elapsedSeconds);
     }
   }, [activityDurations, conversationId, messageId, persistActivityDuration]);
+  const toolGroupExpansionRef = useRef(new Map<string, ToolCallGroupExpansionState>());
+  const fallbackScopeRef = useRef({ messageId, scope: 0 });
+  if (fallbackScopeRef.current.messageId !== messageId) {
+    if (!effectiveIsSubmitting) {
+      fallbackScopeRef.current.scope += 1;
+      toolGroupExpansionRef.current.clear();
+    }
+    fallbackScopeRef.current.messageId = messageId;
+  }
+  const fallbackScope = fallbackScopeRef.current.scope;
+
+  const handleGroupExpansionChange = useCallback(
+    (groupId: string, state: ToolCallGroupExpansionState) => {
+      if (!state.userOverride) {
+        toolGroupExpansionRef.current.delete(groupId);
+        return;
+      }
+      toolGroupExpansionRef.current.set(groupId, state);
+    },
+    [],
+  );
 
   /**
    * Interim skill cards — rendered in a separate slot ABOVE the Parts
@@ -356,7 +393,7 @@ const ContentParts = memo(function ContentParts({
   );
 
   const renderGroupedPart = useCallback(
-    (part: TMessageContentParts, idx: number, isLastPart: boolean) => {
+    (part: TMessageContentParts, idx: number, isLastPart: boolean, onToolExpand?: () => void) => {
       return (
         <PartWithContext
           key={`provider-${messageId}-${idx}`}
@@ -372,6 +409,7 @@ const ContentParts = memo(function ContentParts({
           isSubmitting={effectiveIsSubmitting}
           partAttachments={attachmentMap[getToolCallId(part)]}
           hideAttachments
+          onToolExpand={onToolExpand}
         />
       );
     },
@@ -416,8 +454,10 @@ const ContentParts = memo(function ContentParts({
           units.push(group);
           continue;
         }
+        const groupId = getToolGroupId(group.parts, fallbackScope);
         units.push({
           ...group,
+          groupId,
           groupAttachments: group.parts.flatMap(
             ({ part }) => attachmentMap[getToolCallId(part)] ?? [],
           ),
@@ -452,7 +492,7 @@ const ContentParts = memo(function ContentParts({
 
     flushPendingParts();
     return units;
-  }, [sequentialParts, attachmentMap, isCreatedByUser]);
+  }, [sequentialParts, attachmentMap, isCreatedByUser, fallbackScope]);
 
   // Early return: no content to render AND no pending skill cards
   if (!content && !hasPendingSkills) {
@@ -560,15 +600,18 @@ const ContentParts = memo(function ContentParts({
             />
           );
         }
+        const { groupId } = group;
         return (
           <ToolCallGroup
-            key={`tool-group-${group.parts[0].idx}`}
+            key={`tool-group-${groupId}`}
             parts={group.parts}
             isSubmitting={effectiveIsSubmitting}
             isLast={group.parts.some((p) => p.idx === lastContentIdx)}
             renderPart={renderGroupedPart}
             lastContentIdx={lastContentIdx}
             groupAttachments={group.groupAttachments}
+            initialExpansionState={toolGroupExpansionRef.current.get(groupId)}
+            onExpansionChange={(state) => handleGroupExpansionChange(groupId, state)}
           />
         );
       })}
