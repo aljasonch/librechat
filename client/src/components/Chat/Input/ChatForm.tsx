@@ -22,9 +22,12 @@ import {
   useAssistantsMapContext,
 } from '~/Providers';
 import PendingManualSkillsChips from './PendingManualSkillsChips';
+import useAskAnswerMode from '~/hooks/Input/useAskAnswerMode';
+import AskUserQuestionPopover from './AskUserQuestionPopover';
 import { cn, getModelSpec, removeFocusRings } from '~/utils';
 import { useGetStartupConfig } from '~/data-provider';
 import { mainTextareaId, BadgeItem } from '~/common';
+import PendingQuoteChips from './PendingQuoteChips';
 import AttachFileChat from './Files/AttachFileChat';
 import FileFormChat from './Files/FileFormChat';
 import TextareaHeader from './TextareaHeader';
@@ -32,6 +35,7 @@ import PromptsCommand from './PromptsCommand';
 import SkillsCommand from './SkillsCommand';
 import AudioRecorder from './AudioRecorder';
 import CollapseChat from './CollapseChat';
+import QuoteButton from './QuoteButton';
 import StreamAudio from './StreamAudio';
 import TokenUsage from './TokenUsage';
 import StopButton from './StopButton';
@@ -115,6 +119,12 @@ const ChatForm = memo(function ChatForm({
     () => conversation?.conversationId ?? Constants.NEW_CONVO,
     [conversation?.conversationId],
   );
+  /**
+   * The quote feature merges excerpts server-side in `BaseClient.sendMessage`,
+   * which the Assistants endpoints bypass — so hide the UI there rather than
+   * letting users queue quotes the assistant never receives.
+   */
+  const quotesEnabled = useMemo(() => !isAssistantsEndpoint(endpoint), [endpoint]);
 
   const isRTL = useMemo(
     () => (chatDirection != null ? chatDirection?.toLowerCase() === 'rtl' : false),
@@ -155,12 +165,18 @@ const ChatForm = memo(function ChatForm({
     setIsTextAreaFocused(false);
   }, []);
 
+  const answerMode = useAskAnswerMode(conversationId);
+
   useAutoSave({
     files,
     setFiles,
     textAreaRef,
     conversationId,
     isSubmitting,
+    // While a question pause is live the composer is the answer box: drafts
+    // swap to the answer's own key, and the conversation draft is restored
+    // when the question resolves.
+    draftId: answerMode.draftId,
   });
 
   const { submitMessage, submitPrompt } = useSubmitMessage();
@@ -180,7 +196,10 @@ const ChatForm = memo(function ChatForm({
     submitButtonRef,
     setIsScrollable,
     disabled: disableInputs,
-    placeholder,
+    // The composer IS the free-form answer box while a question pause is live.
+    placeholder: answerMode.active
+      ? (answerMode.otherLabel ?? localize('com_ui_something_else'))
+      : placeholder,
   });
 
   useQueryParams({ textAreaRef });
@@ -237,7 +256,15 @@ const ChatForm = memo(function ChatForm({
 
   return (
     <form
-      onSubmit={methods.handleSubmit(submitMessage)}
+      onSubmit={methods.handleSubmit((data) => {
+        // Answer mode: composer text answers the paused run instead of
+        // starting a new turn (submitText resets the composer itself).
+        // Dismissing the popover restores normal sends.
+        if (answerMode.active && answerMode.submitText(data.text)) {
+          return;
+        }
+        return submitMessage(data);
+      })}
       className={cn(
         'mx-auto flex w-full flex-row gap-3 transition-[max-width] duration-300 sm:px-2',
         maximizeChatSpace ? 'max-w-full' : 'md:max-w-3xl xl:max-w-4xl',
@@ -250,6 +277,8 @@ const ChatForm = memo(function ChatForm({
       )}
     >
       <div className="relative flex h-full flex-1 items-stretch md:flex-col">
+        {/* Primary composer owns the selection popup so split-view doesn't double it. */}
+        {index === 0 && quotesEnabled && <QuoteButton conversationId={conversationId} />}
         <div className={cn('flex w-full items-center', isRTL && 'flex-row-reverse')}>
           <Mention
             index={index}
@@ -267,6 +296,9 @@ const ChatForm = memo(function ChatForm({
             textAreaRef={textAreaRef}
           />
           <PromptsCommand index={index} textAreaRef={textAreaRef} submitPrompt={submitPrompt} />
+          {index === 0 && (
+            <AskUserQuestionPopover conversationId={conversationId} textAreaRef={textAreaRef} />
+          )}
           <SkillsCommand
             index={index}
             textAreaRef={textAreaRef}
@@ -285,6 +317,7 @@ const ChatForm = memo(function ChatForm({
           >
             <TextareaHeader addedConvo={addedConvo} setAddedConvo={setAddedConvo} />
             <PendingManualSkillsChips conversationId={conversationId} />
+            {quotesEnabled && <PendingQuoteChips conversationId={conversationId} />}
             {/* WIP */}
             <EditBadges
               isEditingChatBadges={isEditingBadges}
@@ -320,7 +353,14 @@ const ChatForm = memo(function ChatForm({
                     }}
                     disabled={disableInputs || isNotAppendable}
                     onPaste={handlePaste}
-                    onKeyDown={handleKeyDown}
+                    onKeyDown={(e) => {
+                      // Answer mode consumes option-navigation keys from the
+                      // empty composer; everything else follows the normal path.
+                      if (answerMode.handleComposerKeyDown(e)) {
+                        return;
+                      }
+                      handleKeyDown(e);
+                    }}
                     onKeyUp={handleKeyUp}
                     onCompositionStart={handleCompositionStart}
                     onCompositionEnd={handleCompositionEnd}
@@ -385,20 +425,24 @@ const ChatForm = memo(function ChatForm({
                 <AudioRecorder
                   methods={methods}
                   ask={submitMessage}
-                  textAreaRef={textAreaRef}
                   disabled={disableInputs || isNotAppendable}
                   isSubmitting={isSubmitting}
                 />
               )}
               <div className={`${isRTL ? 'ml-2' : 'mr-2'}`}>
-                {isSubmitting && showStopButton ? (
+                {isSubmitting && showStopButton && !answerMode.active ? (
                   <StopButton stop={handleStopGenerating} setShowStopButton={setShowStopButton} />
                 ) : (
                   endpoint && (
                     <SendButton
                       ref={submitButtonRef}
                       control={methods.control}
-                      disabled={filesLoading || isSubmitting || disableInputs || isNotAppendable}
+                      disabled={
+                        filesLoading ||
+                        disableInputs ||
+                        isNotAppendable ||
+                        (isSubmitting && !answerMode.active)
+                      }
                     />
                   )
                 )}

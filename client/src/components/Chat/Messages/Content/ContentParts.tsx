@@ -14,7 +14,7 @@ import { MessageContext, SearchContext } from '~/Providers';
 import { useUpdateMessageActivityDurationMutation } from '~/data-provider';
 import { EditTextPart, EmptyText } from './Parts';
 import PendingSkillCall from './Parts/PendingSkillCall';
-import { EditTextPart, EmptyText } from './Parts';
+import ApprovalProvider from './ApprovalContext';
 import MemoryArtifacts from './MemoryArtifacts';
 import ToolCallGroup from './ToolCallGroup';
 import Container from './Container';
@@ -552,7 +552,7 @@ const ContentParts = memo(function ContentParts({
   const hasParallelContent = safeContent.some((part) => part?.groupId != null);
   if (hasParallelContent) {
     return (
-      <>
+      <ApprovalProvider>
         {renderPendingSkills()}
         <ParallelContentRenderer
           content={content}
@@ -564,63 +564,65 @@ const ContentParts = memo(function ContentParts({
           isSubmitting={effectiveIsSubmitting}
           renderPart={renderPart}
         />
-      </>
+      </ApprovalProvider>
     );
   }
 
   // Sequential content: render parts in order (90% of cases)
   return (
-    <SearchContext.Provider value={{ searchResults }}>
-      <MemoryArtifacts attachments={attachments} />
-      {renderPendingSkills()}
-      {showEmptyCursor && (
-        <Container>
-          <EmptyText />
-        </Container>
-      )}
-      {renderUnits.map((group) => {
-        if (group.type === 'single') {
-          const { part, idx } = group.part;
-          return renderPart(part, idx, idx === lastContentIdx);
-        }
-        if (group.type === 'timeline') {
-          const isTimelineLive =
-            effectiveIsSubmitting && group.parts.some((p) => p.idx === lastContentIdx);
-          const activityDurationKey = String(group.parts[0].idx);
+    <ApprovalProvider>
+      <SearchContext.Provider value={{ searchResults }}>
+        <MemoryArtifacts attachments={attachments} />
+        {renderPendingSkills()}
+        {showEmptyCursor && (
+          <Container>
+            <EmptyText />
+          </Container>
+        )}
+        {renderUnits.map((group) => {
+          if (group.type === 'single') {
+            const { part, idx } = group.part;
+            return renderPart(part, idx, idx === lastContentIdx);
+          }
+          if (group.type === 'timeline') {
+            const isTimelineLive =
+              effectiveIsSubmitting && group.parts.some((part) => part.idx === lastContentIdx);
+            const activityDurationKey = String(group.parts[0].idx);
+            return (
+              <Timeline
+                key={`timeline-${group.parts[0].idx}`}
+                parts={group.parts}
+                isSubmitting={isTimelineLive}
+                isLast={group.parts.some((part) => part.idx === lastContentIdx)}
+                lastContentIdx={lastContentIdx}
+                searchResults={searchResults}
+                durationKey={`${conversationId ?? 'local'}:${messageId}:${activityDurationKey}`}
+                storedDuration={activityDurations[activityDurationKey]}
+                onDurationFinalized={(elapsedSeconds) =>
+                  persistActivityDuration(activityDurationKey, elapsedSeconds)
+                }
+                getAttachments={(part) => attachmentMap[getToolCallId(part)]}
+                renderPart={renderPart}
+              />
+            );
+          }
+          const { groupId } = group;
           return (
-            <Timeline
-              key={`timeline-${group.parts[0].idx}`}
+            <ToolCallGroup
+              key={`tool-group-${groupId}`}
               parts={group.parts}
-              isSubmitting={isTimelineLive}
+              isSubmitting={effectiveIsSubmitting}
               isLast={group.parts.some((p) => p.idx === lastContentIdx)}
+              renderPart={renderGroupedPart}
               lastContentIdx={lastContentIdx}
-              searchResults={searchResults}
-              durationKey={`${conversationId ?? 'local'}:${messageId}:${activityDurationKey}`}
-              storedDuration={activityDurations[activityDurationKey]}
-              onDurationFinalized={(elapsedSeconds) =>
-                persistActivityDuration(activityDurationKey, elapsedSeconds)
-              }
-              getAttachments={(part) => attachmentMap[getToolCallId(part)]}
-              renderPart={renderPart}
+              groupAttachments={group.groupAttachments}
+              initialExpansionState={toolGroupExpansionRef.current.get(groupId)}
+              onExpansionChange={(state) => handleGroupExpansionChange(groupId, state)}
             />
           );
-        }
-        const { groupId } = group;
-        return (
-          <ToolCallGroup
-            key={`tool-group-${groupId}`}
-            parts={group.parts}
-            isSubmitting={effectiveIsSubmitting}
-            isLast={group.parts.some((p) => p.idx === lastContentIdx)}
-            renderPart={renderGroupedPart}
-            lastContentIdx={lastContentIdx}
-            groupAttachments={group.groupAttachments}
-            initialExpansionState={toolGroupExpansionRef.current.get(groupId)}
-            onExpansionChange={(state) => handleGroupExpansionChange(groupId, state)}
-          />
-        );
-      })}
-    </SearchContext.Provider>
+        })}
+      </SearchContext.Provider>
+    </ApprovalProvider>
   );
 });
 

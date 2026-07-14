@@ -20,6 +20,8 @@ const CREATE_SKILL_MARKER = 'E2E_CREATE_SKILL:';
 const EDIT_SKILL_MARKER = 'E2E_EDIT_SKILL:';
 const ASSERT_MODEL_SPEC_SKILLS_MARKER = 'E2E_ASSERT_MODEL_SPEC_SKILLS';
 const ASSERT_PROVIDER_FILE_MARKER = 'E2E_ASSERT_PROVIDER_FILE:';
+const ASSERT_AGENT_CONTEXT_MARKER = 'E2E_ASSERT_AGENT_CONTEXT:';
+const ASSERT_QUOTE_MARKER = 'E2E_ASSERT_QUOTE:';
 const REPLY_MARKER = 'E2E_REPLY:';
 const COUNTED_REPLY_MARKER = 'E2E_COUNTED_REPLY:';
 const SLOW_REPLY_MARKER = 'E2E_SLOW_REPLY:';
@@ -31,6 +33,8 @@ const CREATE_FILE_AUTHORING_FINAL_TEXT = 'E2E file authoring complete';
 const EDIT_FILE_AUTHORING_FINAL_TEXT = 'E2E file edit complete';
 const MODEL_SPEC_SKILL_ASSERTION_FINAL_TEXT = 'E2E model spec skill assertion passed';
 const PROVIDER_FILE_ASSERTION_FINAL_TEXT = 'E2E provider file assertion passed';
+const AGENT_CONTEXT_ASSERTION_FINAL_TEXT = 'E2E agent context assertion passed';
+const QUOTE_ASSERTION_FINAL_TEXT = 'E2E quote assertion passed';
 const SLOW_CHUNK_DELAY_MS = Number(process.env.MOCK_LLM_SLOW_CHUNK_DELAY_MS) || 35;
 const SLOW_REPLY_CHUNKS = 160;
 const RESUME_ICON_CHUNK_DELAY_MS = Number(process.env.MOCK_LLM_RESUME_ICON_CHUNK_DELAY_MS) || 60;
@@ -161,6 +165,32 @@ function collectAdditionalInstructions(agents) {
     .join('\n');
 }
 
+function collectPromptText(value, parts = []) {
+  if (value == null) {
+    return parts;
+  }
+
+  if (typeof value === 'string') {
+    parts.push(value);
+    return parts;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectPromptText(item, parts);
+    }
+    return parts;
+  }
+
+  if (typeof value === 'object') {
+    for (const child of Object.values(value)) {
+      collectPromptText(child, parts);
+    }
+  }
+
+  return parts;
+}
+
 function collectSkillPrimeMessages(messages) {
   return (messages ?? [])
     .filter((message) => message?.additional_kwargs?.source === 'skill')
@@ -229,6 +259,59 @@ function providerFileAssertionResponses({ messages, text }) {
         Array.from(providerFileNames).join(', ') || 'no provider files'
       }`,
     ],
+  };
+}
+
+function agentContextAssertionResponses({ messages, text }) {
+  const expected = getMarkerValue(text, ASSERT_AGENT_CONTEXT_MARKER);
+  if (!expected) {
+    return null;
+  }
+
+  const promptText = collectPromptText(messages).join('\n');
+  if (promptText.includes(expected)) {
+    return {
+      responses: [`${AGENT_CONTEXT_ASSERTION_FINAL_TEXT}: ${expected}`],
+    };
+  }
+
+  return {
+    responses: [
+      `E2E agent context assertion failed: expected ${expected}; saw ${
+        promptText ? 'prompt context without marker' : 'no prompt context'
+      }`,
+    ],
+  };
+}
+
+/**
+ * Verifies the quote feature end to end: scans every user message in the prompt
+ * the model actually received for a Markdown blockquote line containing the
+ * expected token. Passing proves the excerpt was merged into the model-facing
+ * turn — covering both the current turn and durable re-merge of a prior quoted
+ * turn from history (the merge runs in `AgentClient.buildMessages`).
+ */
+function quoteAssertionResponses({ messages, text }) {
+  const expected = getMarkerValue(text, ASSERT_QUOTE_MARKER);
+  if (!expected) {
+    return null;
+  }
+
+  const found = (messages ?? []).some((message) => {
+    const type = messageType(message);
+    if (type !== 'human' && type !== 'user') {
+      return false;
+    }
+    return getContentText(message.content)
+      .split('\n')
+      .some((line) => line.startsWith('> ') && line.includes(expected));
+  });
+
+  if (found) {
+    return { responses: [`${QUOTE_ASSERTION_FINAL_TEXT}: ${expected}`] };
+  }
+  return {
+    responses: [`E2E quote assertion failed: no blockquote containing "${expected}" in the prompt`],
   };
 }
 
@@ -321,9 +404,46 @@ function replyResponses(text) {
  * streaming pattern) so token-usage SSE events flow end to end in mock runs.
  */
 class UsageEmittingFakeChatModel extends FakeChatModel {
+  constructor({ resolveOnStream, sleep, ...options }) {
+    super({ ...options, sleep });
+    this.resolveOnStream = resolveOnStream;
+    this.streamSleep = sleep ?? CHUNK_DELAY_MS;
+  }
+
+  async *streamDynamicResponseChunks({ responses, options, runManager }) {
+    if (this.emitCustomEvent) {
+      await runManager?.handleCustomEvent('some_test_event', {
+        someval: true,
+      });
+    }
+
+    const response = responses[0] ?? '';
+    const chunks = response.split(/(?<=\s+)|(?=\s+)/);
+    for await (const chunk of chunks) {
+      await new Promise((resolve) => setTimeout(resolve, this.streamSleep));
+
+      if (options.thrownErrorString != null && options.thrownErrorString) {
+        throw new Error(options.thrownErrorString);
+      }
+
+      const responseChunk = this._createResponseChunk(chunk);
+      yield responseChunk;
+      void runManager?.handleLLMNewToken(chunk);
+    }
+  }
+
   async *_streamResponseChunks(messages, options, runManager) {
     let outputChars = 0;
-    for await (const chunk of super._streamResponseChunks(messages, options, runManager)) {
+    const dynamicResponse = this.resolveOnStream?.(messages);
+    const chunkStream = dynamicResponse
+      ? this.streamDynamicResponseChunks({
+          responses: dynamicResponse.responses,
+          options,
+          runManager,
+        })
+      : super._streamResponseChunks(messages, options, runManager);
+
+    for await (const chunk of chunkStream) {
       outputChars += typeof chunk.text === 'string' ? chunk.text.length : 0;
       yield chunk;
     }
@@ -343,13 +463,14 @@ class UsageEmittingFakeChatModel extends FakeChatModel {
   }
 }
 
-function overrideModel({ graph, responses, sleep, toolCalls, thrownError }) {
+function overrideModel({ graph, responses, sleep, toolCalls, thrownError, resolveOnStream }) {
   if (!thrownError) {
     graph.overrideModel = new UsageEmittingFakeChatModel({
       responses,
       sleep: sleep ?? CHUNK_DELAY_MS,
       emitCustomEvent: true,
       toolCalls,
+      resolveOnStream,
     });
     return;
   }
@@ -427,7 +548,7 @@ Created by the Playwright mock e2e suite to verify host file authoring without c
 
 function buildCreateSkillArgs(skillName) {
   return {
-    file_path: `skills/${skillName}/SKILL.md`,
+    path: `skills/${skillName}/SKILL.md`,
     content: buildSkillBody(skillName),
     overwrite: false,
   };
@@ -435,7 +556,7 @@ function buildCreateSkillArgs(skillName) {
 
 function buildEditSkillArgs(skillName) {
   return {
-    file_path: `skills/${skillName}/SKILL.md`,
+    path: `skills/${skillName}/SKILL.md`,
     old_text: `description: ${SKILL_DESCRIPTION}`,
     new_text: `description: ${EDITED_SKILL_DESCRIPTION}`,
   };
@@ -478,9 +599,22 @@ function resolveResponses({ agents, messages, text, toolNames }) {
     return reply;
   }
 
+  if (text.includes(ASSERT_AGENT_CONTEXT_MARKER)) {
+    return {
+      responses: [MOCK_REPLY],
+      resolveOnStream: (streamMessages) =>
+        agentContextAssertionResponses({ messages: streamMessages, text }),
+    };
+  }
+
   const providerFileAssertion = providerFileAssertionResponses({ messages, text });
   if (providerFileAssertion) {
     return providerFileAssertion;
+  }
+
+  const quoteAssertion = quoteAssertionResponses({ messages, text });
+  if (quoteAssertion) {
+    return quoteAssertion;
   }
 
   if (text.includes(ASSERT_MODEL_SPEC_SKILLS_MARKER)) {
@@ -528,11 +662,11 @@ module.exports = function fakeModelHook(run, context) {
 
   const text = getLatestUserText(context?.messages);
   const toolNames = collectToolNames(context?.agents);
-  const { responses, sleep, toolCalls, thrownError } = resolveResponses({
+  const { responses, sleep, toolCalls, thrownError, resolveOnStream } = resolveResponses({
     agents: context?.agents,
     messages: context?.messages,
     text,
     toolNames,
   });
-  overrideModel({ graph, responses, sleep, toolCalls, thrownError });
+  overrideModel({ graph, responses, sleep, toolCalls, thrownError, resolveOnStream });
 };

@@ -51,6 +51,7 @@ export * from './prompts';
 export * from './projects';
 /* Skills */
 export * from './skills';
+export * from './favorites';
 /* Endpoints */
 export * from './endpoints';
 /* Files */
@@ -68,6 +69,7 @@ export * from './cache';
 /* Shared Links */
 export * from './shared-links/access';
 export * from './shared-links/service';
+export * from './shared-links/config';
 /* Stream */
 export * from './stream';
 /* Diagnostics */
