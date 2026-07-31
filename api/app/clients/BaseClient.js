@@ -41,6 +41,16 @@ const collectHistoricalFileRefs = (message) => {
   if (Array.isArray(message.attachments)) {
     refs.push(...message.attachments);
   }
+  /** Steer parts carry their own attachment refs inside assistant content;
+   *  collecting them here folds the steer replay stamp's lookup into this
+   *  single per-turn query (see `stampSteerPartMedia`). */
+  if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (part?.type === ContentTypes.STEER && Array.isArray(part.files)) {
+        refs.push(...part.files);
+      }
+    }
+  }
   return refs;
 };
 
@@ -379,6 +389,7 @@ class BaseClient {
       parentMessageId,
       responseMessageId,
     } = await this.setMessageOptions(opts);
+    this.options.startupTelemetry?.mark('history_loaded');
 
     const userMessage = opts.isEdited
       ? this.currentMessages[this.currentMessages.length - 2]
@@ -600,6 +611,7 @@ class BaseClient {
       this.getBuildMessagesOptions(opts),
       opts,
     );
+    this.options.startupTelemetry?.mark('messages_built');
 
     if (tokenCountMap && tokenCountMap[userMessage.messageId]) {
       userMessage.tokenCount = tokenCountMap[userMessage.messageId];
@@ -1457,6 +1469,9 @@ class BaseClient {
         }
       }
     }
+    /** Owner-scoped docs for THIS turn, including steer-part refs — the steer
+     *  replay stamp consumes this instead of issuing a second query. */
+    this.authorizedHistoricalFiles = authorizedFilesById;
 
     /**
      *
@@ -1508,8 +1523,10 @@ class BaseClient {
         return message;
       }
 
-      await this.addFileContextToMessage(message, contextFiles);
-      await this.processAttachments(message, contextFiles);
+      await Promise.all([
+        this.addFileContextToMessage(message, contextFiles),
+        this.processAttachments(message, contextFiles),
+      ]);
 
       this.message_file_map[message.messageId] = contextFiles;
       return message;

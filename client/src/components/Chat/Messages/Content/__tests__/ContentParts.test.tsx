@@ -11,6 +11,7 @@ jest.mock('~/data-provider', () => ({
 
 jest.mock('~/utils', () => ({
   mapAttachments: () => ({}),
+  filterAttachmentsForPart: (attachments: unknown) => attachments,
   groupSequentialToolCalls: (parts: Array<{ part: unknown; idx: number }>) =>
     parts.map((p) => ({ type: 'single' as const, part: p })),
 }));
