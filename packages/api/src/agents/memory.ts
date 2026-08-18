@@ -415,8 +415,9 @@ export function registerMemoryTools({
   toolRegistry?: LCToolRegistry;
   toolDefinitions?: LCTool[];
   validKeys?: string[];
-}): { toolDefinitions: LCTool[]; registered: string[] } {
+}): { toolDefinitions: LCTool[]; registered: string[]; toolNames: string[] } {
   const memoryToolDefinitions = getMemoryToolDefinitions(validKeys);
+  const toolNames = memoryToolDefinitions.map((def) => def.name);
   const inputDefinitions = toolDefinitions ?? [];
   const newDefs: LCTool[] = [];
   const registered: string[] = [];
@@ -433,9 +434,9 @@ export function registerMemoryTools({
   }
 
   if (newDefs.length === 0) {
-    return { toolDefinitions: inputDefinitions, registered };
+    return { toolDefinitions: inputDefinitions, registered, toolNames };
   }
-  return { toolDefinitions: [...inputDefinitions, ...newDefs], registered };
+  return { toolDefinitions: [...inputDefinitions, ...newDefs], registered, toolNames };
 }
 
 type GetRoleByName = (
@@ -486,6 +487,39 @@ export function agentHasInlineMemoryTools(agent: InlineMemoryAgent): boolean {
     (entry) =>
       (typeof entry === 'string' ? entry : (entry as { name?: string })?.name) === Tools.memory,
   );
+}
+
+/** Builds the existing-memory system context for an inline-memory agent. */
+export async function buildInlineMemoryContext({
+  agent,
+  req,
+  userId,
+  memoryAvailable,
+  getFormattedMemories,
+}: {
+  agent: InlineMemoryAgent;
+  req: ServerRequest;
+  userId: string | ObjectId;
+  memoryAvailable: boolean;
+  getFormattedMemories: MemoryMethods['getFormattedMemories'];
+}): Promise<string> {
+  if (!memoryAvailable || !agentHasInlineMemoryTools(agent)) {
+    return '';
+  }
+  try {
+    const memories = await getRequestMemories({
+      req,
+      userId,
+      agentId: getMemoryAgentId(agent),
+      getFormattedMemories,
+    });
+    return memories.withKeys
+      ? `${memoryInstructions}\n\n# Existing memory about the user:\n${memories.withKeys}`
+      : '';
+  } catch (error) {
+    logger.error('[memory] Error loading inline agent memory context', error);
+    return '';
+  }
 }
 
 /**

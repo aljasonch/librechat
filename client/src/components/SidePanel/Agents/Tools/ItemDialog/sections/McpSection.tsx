@@ -1,7 +1,13 @@
 import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Clock, Code2, Zap } from 'lucide-react';
+import { Clock, Code2, Captions, Zap } from 'lucide-react';
 import { useFormContext, useWatch } from 'react-hook-form';
 import { Button, Spinner, Checkbox, Skeleton } from '@librechat/client';
+import {
+  Constants,
+  splitMCPToolKey,
+  normalizeServerName,
+  buildServerNameAliases,
+} from 'librechat-data-provider';
 import type { MouseEvent } from 'react';
 import type { TranslationKeys } from '~/hooks/useLocalize';
 import type { McpItem } from '../../items/types';
@@ -12,8 +18,8 @@ import {
   useMCPServerManager,
   useMCPToolOptions,
 } from '~/hooks';
+import { matchesMcpServer, mcpAllToken, mcpServerToken } from '../../items/selectors';
 import MCPServerStatusIcon from '~/components/MCP/MCPServerStatusIcon';
-import { mcpAllToken, mcpServerToken } from '../../items/selectors';
 import MCPConfigDialog from '~/components/MCP/MCPConfigDialog';
 import McpOAuthDialog from '~/components/MCP/McpOAuthDialog';
 import { useAgentPanelContext } from '~/Providers';
@@ -76,21 +82,30 @@ export default function McpSection({ item }: Props) {
   const [autoSelectPending, setAutoSelectPending] = useState(false);
   const { mcpServersMap, mcpToolsLoading } = useAgentPanelContext();
   const { agentsConfig } = useGetAgentsConfig();
-  const { deferredToolsEnabled, programmaticToolsEnabled, backgroundToolsEnabled } =
-    useAgentCapabilities(agentsConfig?.capabilities);
+  const {
+    deferredToolsEnabled,
+    programmaticToolsEnabled,
+    backgroundToolsEnabled,
+    toolIntentsEnabled,
+  } = useAgentCapabilities(agentsConfig?.capabilities);
   const {
     isToolDeferred,
     isToolProgrammatic,
     isToolBackground,
+    isToolIntent,
+    isToolProgrammaticOnly,
     toggleToolDefer,
     toggleToolProgrammatic,
     toggleToolBackground,
+    toggleToolIntent,
     areAllToolsDeferred,
     areAllToolsProgrammatic,
     areAllToolsBackground,
+    areAllToolsIntent,
     toggleDeferAll,
     toggleProgrammaticAll,
     toggleBackgroundAll,
+    toggleIntentAll,
   } = useMCPToolOptions();
 
   const serverName = item.server.serverName;
@@ -109,32 +124,138 @@ export default function McpSection({ item }: Props) {
    * servers whose tools resolve at chat-turn time and can't be listed here. */
   const isWildcardAttached = formTools.includes(serverAllToken);
 
+  /**
+   * Maps a legacy raw-keyed form entry for THIS server to its current
+   * (normalized) catalog id — an agent saved before tool keys embedded the
+   * normalized server name would otherwise show its tools unchecked while the
+   * runtime heal keeps them active, and per-tool updates could never replace
+   * the legacy entry. Tokens and other servers' entries pass through.
+   */
+  const toCurrentToolId = useCallback(
+    (entry: string): string => {
+      const normalizedName = normalizeServerName(serverName);
+      if (
+        normalizedName === serverName ||
+        entry === serverToken ||
+        entry === serverAllToken ||
+        !entry.endsWith(`${Constants.mcp_delimiter}${serverName}`)
+      ) {
+        return entry;
+      }
+      /** Boundary-exact: this raw suffix could equally terminate a LONGER
+       *  configured server name — resolve the entry once against every
+       *  configured server (both spellings, longest match) and rewrite only
+       *  when it truly belongs to THIS server, or the migration could
+       *  reassign another server's persisted settings. */
+      /** Include THIS server even when a stale catalog map omits it, so a
+       *  missing entry doesn't misread as a collision. */
+      const allServerNames = Array.from(new Set([...mcpServersMap.keys(), serverName]));
+      const aliases = buildServerNameAliases(allServerNames);
+      /** A SHADOWED server (its normalized slot claimed by another catalog
+       *  name) keeps legacy keys raw — the runtime heal fails closed the
+       *  same way; rewriting here would move this server's persisted
+       *  options onto the winning server's key. */
+      if (aliases.get(normalizedName) !== serverName) {
+        return entry;
+      }
+      const [, parsed] = splitMCPToolKey(entry, [...allServerNames, ...aliases.keys()]);
+      if (parsed == null || (aliases.get(parsed) ?? parsed) !== serverName) {
+        return entry;
+      }
+      return `${entry.slice(0, entry.length - serverName.length)}${normalizedName}`;
+    },
+    [serverName, serverToken, serverAllToken, mcpServersMap],
+  );
+
+  const isServerSelection = useCallback(
+    (token: string): boolean => {
+      const allServerNames = Array.from(new Set([...mcpServersMap.keys(), serverName]));
+      return (
+        matchesMcpServer(token, serverName, allServerNames) ||
+        tools.some((tool) => tool.tool_id === toCurrentToolId(token))
+      );
+    },
+    [mcpServersMap, serverName, tools, toCurrentToolId],
+  );
+
+  /**
+   * Migrates legacy raw-keyed `tool_options` for THIS server to the current
+   * normalized ids the option toggles (defer / programmatic / background /
+   * intent) read and write — otherwise a persisted option shows disabled
+   * while the runtime heal keeps honoring it, and toggling the normalized
+   * control leaves the raw entry behind. An existing normalized entry wins
+   * over the legacy one on collision. Form state only; the user's next real
+   * edit persists it.
+   */
+  const formToolOptions = useWatch({ control, name: 'tool_options' });
+  useEffect(() => {
+    if (!formToolOptions) {
+      return;
+    }
+    const entries = Object.entries(formToolOptions);
+    if (!entries.some(([key]) => toCurrentToolId(key) !== key)) {
+      return;
+    }
+    const migrated: typeof formToolOptions = {};
+    for (const [key, options] of entries) {
+      if (toCurrentToolId(key) === key) {
+        migrated[key] = options;
+      }
+    }
+    for (const [key, options] of entries) {
+      const target = toCurrentToolId(key);
+      if (target === key) {
+        continue;
+      }
+      migrated[target] = { ...options, ...migrated[target] };
+    }
+    setValue('tool_options', migrated);
+  }, [formToolOptions, toCurrentToolId, setValue]);
+
   /** The `mcp_all` wildcard grants every server tool at runtime, so when the
    * server's tools ARE enumerable (e.g. it stopped being request-scoped), fold
    * the wildcard into the display as "all selected" — otherwise the dialog
    * would show unchecked boxes while runtime grants everything. Any selection
    * interaction then rewrites the form with concrete tool ids (the wildcard is
    * stripped by `updateFormTools`), converting the attachment on first touch. */
-  const getSelectedTools = (): string[] =>
-    isWildcardAttached
-      ? tools.map((t) => t.tool_id)
-      : tools.filter((t) => formTools.includes(t.tool_id)).map((t) => t.tool_id);
+  const getSelectedTools = (): string[] => {
+    if (isWildcardAttached) {
+      return tools.map((t) => t.tool_id);
+    }
+    const formToolIds = new Set(formTools.map(toCurrentToolId));
+    return tools.filter((t) => formToolIds.has(t.tool_id)).map((t) => t.tool_id);
+  };
 
   /** Replace this server's tool selection while keeping the server attached: the
    * placeholder token is always rewritten, so deselect-all leaves the server
    * pinned with zero tools; only an explicit remove detaches it. The `mcp_all`
    * wildcard is also stripped unless explicitly re-passed in `next`, so a
    * per-tool selection always supersedes a stale wildcard (e.g. after a server
-   * stops being request-scoped and its tools become enumerable). */
+   * stops being request-scoped and its tools become enumerable). Legacy
+   * raw-keyed and removed-tool entries count as this server's via boundary-safe
+   * server matching, so a selection update REPLACES them instead of letting an
+   * invisible stale tool survive every rewrite. */
   const updateFormTools = useCallback(
     (next: string[]) => {
       const current = (getValues('tools') ?? []) as string[];
-      const otherTools = current.filter(
-        (t) => t !== serverToken && t !== serverAllToken && !tools.some((st) => st.tool_id === t),
-      );
+      const otherTools = current.filter((tool) => !isServerSelection(tool));
       setValue('tools', [...otherTools, serverToken, ...next], { shouldDirty: true });
     },
-    [getValues, setValue, serverToken, serverAllToken, tools],
+    [getValues, isServerSelection, serverToken, setValue],
+  );
+
+  /** Request-scoped servers have no per-tool catalog outside a chat turn. Their
+   *  sole meaningful selection is the runtime wildcard, so clearing it detaches
+   *  the whole server instead of leaving behind an unusable server-only pin. */
+  const toggleRuntimeTools = useCallback(
+    (checked: boolean) => {
+      const current = (getValues('tools') ?? []) as string[];
+      const otherTools = current.filter((tool) => !isServerSelection(tool));
+      setValue('tools', checked ? [...otherTools, serverToken, serverAllToken] : otherTools, {
+        shouldDirty: true,
+      });
+    },
+    [getValues, isServerSelection, serverAllToken, serverToken, setValue],
   );
 
   const toggleToolSelect = (toolId: string) => {
@@ -154,6 +275,11 @@ export default function McpSection({ item }: Props) {
   const allDeferred = areAllToolsDeferred(tools);
   const allProgrammatic = areAllToolsProgrammatic(tools);
   const allBackground = areAllToolsBackground(tools);
+  /** Programmatic-only tools can never carry an intent label (the backend's
+   *  `canInjectIntentParam` skips non-direct tools), so both the bulk toggle
+   *  and its all-state only consider tools the label can actually reach. */
+  const intentEligibleTools = tools.filter((tool) => !isToolProgrammaticOnly(tool.tool_id));
+  const allIntent = areAllToolsIntent(intentEligibleTools);
   const statusIconProps = getServerStatusIconProps(serverName);
   const configDialogProps = getConfigDialogProps();
   const connectionState = statusIconProps?.serverStatus?.connectionState;
@@ -164,7 +290,7 @@ export default function McpSection({ item }: Props) {
    * both cases instead of a misleading "no tools" message. */
   const toolsLoading =
     !hasTools && (mcpToolsLoading || isInitializing || connectionState === 'connecting');
-  const isConnected = connectionState === 'connected';
+  const isConnected = connectionState === 'connected' || liveServer.isConnected === true;
   const isBusy = isInitializing || connectionState === 'connecting';
 
   /** Close + clear the OAuth dialog once the server connects, and don't let it
@@ -190,15 +316,21 @@ export default function McpSection({ item }: Props) {
    * manager's init state (not the awaited response) also covers connects that
    * happen behind the customUserVars config dialog, which this component does
    * not await. */
-  const serverDeferred = isConnectionDeferred(serverName);
+  const initConnectionDeferred = isConnectionDeferred(serverName);
+  const requestScoped = liveServer.requestScoped === true;
+  const runtimeToolsAvailable =
+    !hasTools && !toolsLoading && (isWildcardAttached || (requestScoped && isConnected));
+  const runtimeToolsMessage = isWildcardAttached
+    ? 'com_ui_tools_mcp_runtime_tools'
+    : 'com_ui_tools_mcp_runtime_tools_available';
   useEffect(() => {
     if (!autoSelectPending) {
       return;
     }
-    if (serverDeferred && !hasTools) {
+    if (initConnectionDeferred && !hasTools) {
       setAutoSelectPending(false);
       if (!isWildcardAttached) {
-        updateFormTools([serverAllToken]);
+        toggleRuntimeTools(true);
       }
       return;
     }
@@ -209,13 +341,13 @@ export default function McpSection({ item }: Props) {
     updateFormTools(tools.map((t) => t.tool_id));
   }, [
     autoSelectPending,
-    serverDeferred,
+    initConnectionDeferred,
     isConnected,
     hasTools,
     tools,
     updateFormTools,
+    toggleRuntimeTools,
     isWildcardAttached,
-    serverAllToken,
   ]);
 
   /** Connect inline from this first dialog. Servers with custom user variables are
@@ -301,9 +433,9 @@ export default function McpSection({ item }: Props) {
           <span className="text-[11px] font-medium uppercase tracking-wide text-text-secondary">
             {localize('com_ui_tools_mcp_tools_section')}
           </span>
-          {hasTools && (
+          {(hasTools || runtimeToolsAvailable) && (
             <div className="flex items-center gap-0.5">
-              {deferredToolsEnabled && (
+              {hasTools && deferredToolsEnabled && (
                 <OptionToggle
                   icon={Clock}
                   size="md"
@@ -313,7 +445,7 @@ export default function McpSection({ item }: Props) {
                   onToggle={() => toggleDeferAll(tools)}
                 />
               )}
-              {programmaticToolsEnabled && (
+              {hasTools && programmaticToolsEnabled && (
                 <OptionToggle
                   icon={Code2}
                   size="md"
@@ -327,7 +459,7 @@ export default function McpSection({ item }: Props) {
                   onToggle={() => toggleProgrammaticAll(tools)}
                 />
               )}
-              {backgroundToolsEnabled && (
+              {hasTools && backgroundToolsEnabled && (
                 <OptionToggle
                   icon={Zap}
                   size="md"
@@ -339,22 +471,39 @@ export default function McpSection({ item }: Props) {
                   onToggle={() => toggleBackgroundAll(tools)}
                 />
               )}
-              {(deferredToolsEnabled || programmaticToolsEnabled || backgroundToolsEnabled) && (
-                <span className="mx-1 h-4 w-px bg-border-light" aria-hidden="true" />
+              {hasTools && toolIntentsEnabled && (
+                <OptionToggle
+                  icon={Captions}
+                  size="md"
+                  pressed={allIntent}
+                  disabled={intentEligibleTools.length === 0}
+                  label={localize(allIntent ? 'com_ui_mcp_unintent_all' : 'com_ui_mcp_intent_all')}
+                  activeClass="text-teal-600 dark:text-teal-500"
+                  onToggle={() => toggleIntentAll(intentEligibleTools)}
+                />
               )}
+              {hasTools &&
+                (deferredToolsEnabled ||
+                  programmaticToolsEnabled ||
+                  backgroundToolsEnabled ||
+                  toolIntentsEnabled) && (
+                  <span className="mx-1 h-4 w-px bg-border-light" aria-hidden="true" />
+                )}
               <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-xs text-text-secondary">
                 <Checkbox
-                  checked={allSelected}
-                  onCheckedChange={(checked) => toggleAll(checked === true)}
+                  checked={hasTools ? allSelected : isWildcardAttached}
+                  onCheckedChange={(checked) =>
+                    hasTools ? toggleAll(checked === true) : toggleRuntimeTools(checked === true)
+                  }
                   aria-label={
-                    allSelected
+                    (hasTools ? allSelected : isWildcardAttached)
                       ? localize('com_ui_tools_mcp_deselect_all')
                       : localize('com_ui_tools_mcp_select_all')
                   }
                   className="size-4 rounded border border-border-medium"
                 />
                 <span>
-                  {allSelected
+                  {(hasTools ? allSelected : isWildcardAttached)
                     ? localize('com_ui_tools_mcp_deselect_all')
                     : localize('com_ui_tools_mcp_select_all')}
                 </span>
@@ -376,13 +525,21 @@ export default function McpSection({ item }: Props) {
                   isDeferred={deferredToolsEnabled && isToolDeferred(tool.tool_id)}
                   isProgrammatic={programmaticToolsEnabled && isToolProgrammatic(tool.tool_id)}
                   isBackground={backgroundToolsEnabled && isToolBackground(tool.tool_id)}
+                  isIntent={
+                    toolIntentsEnabled &&
+                    isToolIntent(tool.tool_id) &&
+                    !isToolProgrammaticOnly(tool.tool_id)
+                  }
+                  intentDisabled={isToolProgrammaticOnly(tool.tool_id)}
                   deferredToolsEnabled={deferredToolsEnabled}
                   programmaticToolsEnabled={programmaticToolsEnabled}
                   backgroundToolsEnabled={backgroundToolsEnabled}
+                  toolIntentsEnabled={toolIntentsEnabled}
                   onToggleSelect={() => toggleToolSelect(tool.tool_id)}
                   onToggleDefer={() => toggleToolDefer(tool.tool_id)}
                   onToggleProgrammatic={() => toggleToolProgrammatic(tool.tool_id)}
                   onToggleBackground={() => toggleToolBackground(tool.tool_id)}
+                  onToggleIntent={() => toggleToolIntent(tool.tool_id)}
                 />
               ))}
             </div>
@@ -399,9 +556,7 @@ export default function McpSection({ item }: Props) {
           </Collapse>
           <Collapse open={!hasTools && !toolsLoading}>
             <p className="rounded-xl border border-dashed border-border-light p-3 text-center text-xs text-text-tertiary">
-              {localize(
-                isWildcardAttached ? 'com_ui_tools_mcp_runtime_tools' : 'com_ui_tools_mcp_no_tools',
-              )}
+              {localize(runtimeToolsAvailable ? runtimeToolsMessage : 'com_ui_tools_mcp_no_tools')}
             </p>
           </Collapse>
         </div>

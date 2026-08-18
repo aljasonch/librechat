@@ -20,6 +20,7 @@
  */
 import { nanoid } from 'nanoid';
 import { AgentCapabilities } from 'librechat-data-provider';
+import type { StatefulCodeEnvironment } from 'librechat-data-provider';
 import type { Response as ServerResponse, Request } from 'express';
 import type {
   ChatCompletionResponse,
@@ -120,6 +121,8 @@ interface InitializedAgent {
   toolContextMap: Record<string, unknown>;
   maxContextTokens: number;
   userMCPAuthMap?: Record<string, Record<string, string>>;
+  /** Names of tools with the host-injected `intent` label param (see `agents/intent.ts`). */
+  intentToolNames?: string[];
   [key: string]: unknown;
 }
 
@@ -153,6 +156,8 @@ interface InitializeAgentParams {
    * in-repo controllers; absent / `undefined` disables the feature.
    */
   statefulSessionsAvailable?: boolean;
+  /** Deployment allowlist carried explicitly because this route's Request has no req.config. */
+  allowedStatefulCodeEnvironments?: readonly StatefulCodeEnvironment[];
   /**
    * Whether the admin-level `run_in_background` capability is enabled.
    * Gates `applyBackgroundToolCalls` in `initializeAgent` (the injected
@@ -160,6 +165,18 @@ interface InitializeAgentParams {
    * absent / `undefined` disables background tool calls on this route.
    */
   backgroundToolsAvailable?: boolean;
+  /**
+   * Whether the admin-level `tool_intents` capability is enabled. Gates
+   * `applyIntentLabels` in `initializeAgent` (the injected `intent` label
+   * param); absent / `undefined` disables intent labels on this route.
+   *
+   * Boundary: injection and the capability-off sanitize operate on the
+   * `toolDefinitions`/`toolRegistry` surfaces. A custom `LoadToolsFn` that
+   * returns only structured tool INSTANCES bypasses both — such loaders
+   * must provide definition/registry surfaces to participate in intent
+   * labels (matching how the in-repo tool loader behaves).
+   */
+  toolIntentsAvailable?: boolean;
 }
 
 /**
@@ -457,16 +474,26 @@ export async function createAgentChatCompletion(
         ? ((agentsConfig as { capabilities?: string[] }).capabilities ?? []).includes(capability)
         : undefined;
     const codeEnvAvailable = capabilityEnabled(AgentCapabilities.execute_code);
-    /** Mirror `codeEnvAvailable` for the stateful-session gate so an agent with
-     *  `execute_code`, the app `stateful_code_sessions` capability, and its own
-     *  builder opt-in resolves stateful sessions on this route too — otherwise
-     *  `statefulCodeSessions` stays false and `createRun` never sends
-     *  `toolExecution.sandbox`. */
+    /** Mirror `codeEnvAvailable` for the stateful-session gate so this route
+     *  also carries each agent's trusted stateful endpoint/profile selection
+     *  into tool loading and prewarming. */
     const statefulSessionsAvailable = capabilityEnabled(AgentCapabilities.stateful_code_sessions);
+    const allowedStatefulCodeEnvironments =
+      agentsConfig != null && typeof agentsConfig === 'object'
+        ? (
+            agentsConfig as {
+              statefulCodeSessions?: {
+                allowedEnvironments?: readonly StatefulCodeEnvironment[];
+              };
+            }
+          ).statefulCodeSessions?.allowedEnvironments
+        : undefined;
     /** Same gate as the in-repo controllers: without it, agents that opted
      *  tools in via tool_options.run_in_background silently lose the
      *  background param + poll tool on this route. */
     const backgroundToolsAvailable = capabilityEnabled(AgentCapabilities.run_in_background);
+    /** Same gate for the injected `intent` label param. */
+    const toolIntentsAvailable = capabilityEnabled(AgentCapabilities.tool_intents);
 
     // Initialize the agent first to check for disableStreaming
     const initializedAgent = await deps.initializeAgent({
@@ -484,7 +511,9 @@ export async function createAgentChatCompletion(
       isInitialAgent: true,
       codeEnvAvailable,
       statefulSessionsAvailable,
+      allowedStatefulCodeEnvironments,
       backgroundToolsAvailable,
+      toolIntentsAvailable,
     });
 
     // Determine if streaming is enabled (check both request and agent config)
@@ -571,6 +600,13 @@ export async function createAgentChatCompletion(
               thread_id: conversationId,
               user_id: userId,
               user: safeUser,
+              /** Same per-agent channel the in-repo controllers thread via
+               *  `loadTools`: without it, the executor's PTC path cannot
+               *  strip host-injected `intent` params from the schemas the
+               *  sandbox bridge advertises on this route. */
+              ...(initializedAgent.intentToolNames?.length
+                ? { intentToolNames: initializedAgent.intentToolNames }
+                : {}),
             },
             signal: abortController.signal,
             streamMode: 'values',
@@ -615,7 +651,27 @@ export async function createAgentChatCompletion(
       writeSSE(res, '[DONE]');
       res.end();
     } else {
-      sendErrorResponse(res, 500, errorMessage, 'server_error');
+      const candidateStatus =
+        error != null && typeof error === 'object'
+          ? ((error as { status?: unknown; statusCode?: unknown }).status ??
+            (error as { statusCode?: unknown }).statusCode)
+          : undefined;
+      const statusCode =
+        typeof candidateStatus === 'number' &&
+        Number.isInteger(candidateStatus) &&
+        candidateStatus >= 400 &&
+        candidateStatus < 600
+          ? candidateStatus
+          : 500;
+      const errorType =
+        statusCode >= 400 && statusCode < 500 ? 'invalid_request_error' : 'server_error';
+      const errorCode =
+        error != null &&
+        typeof error === 'object' &&
+        typeof (error as { code?: unknown }).code === 'string'
+          ? (error as { code: string }).code
+          : null;
+      sendErrorResponse(res, statusCode, errorMessage, errorType, errorCode);
     }
   }
 }

@@ -3,6 +3,7 @@ import {
   AUTH_USER_DOC_BY_ID_PREFIX,
   CacheKeys,
   type RefillIntervalUnit,
+  type StatefulCodeEnvironment,
 } from 'librechat-data-provider';
 import type { IUser, BalanceConfig, CreateUserRequest, UserDeleteResult } from '~/types';
 import type { CacheStore } from '~/types';
@@ -11,6 +12,8 @@ import { signPayload } from '~/crypto';
 
 /** Default JWT session expiry: 15 minutes in milliseconds */
 export const DEFAULT_SESSION_EXPIRY: number = 1000 * 60 * 15;
+/** Minimum age before an explicitly offline operator may recover an abandoned deletion fence. */
+export const USER_DELETION_FENCE_STALE_MS: number = 15 * 60_000;
 
 interface UserMethodDeps {
   getCache?: (key: string) => CacheStore | undefined;
@@ -93,6 +96,7 @@ export function createUserMethods(
       termsAccepted?: boolean;
       personalization?: {
         memories?: boolean;
+        statefulCodeEnvironment?: import('librechat-data-provider').StatefulCodeEnvironment;
       };
       favorites?: import('librechat-data-provider').TUserFavorite[];
       skillStates?: Record<string, boolean>;
@@ -115,6 +119,16 @@ export function createUserMethods(
   >;
   getUserById: (userId: string, fieldsToSelect?: string | string[] | null) => Promise<IUser | null>;
   generateToken: (user: IUser, expiresIn?: number) => Promise<string>;
+  beginAgentTriggerUserDeletion: (
+    userId: string,
+    startedAt: Date,
+  ) => Promise<'acquired' | 'in_progress' | 'missing'>;
+  recoverStaleAgentTriggerUserDeletion: (
+    userId: string,
+    recoveredAt: Date,
+  ) => Promise<'acquired' | 'in_progress' | 'missing'>;
+  cancelAgentTriggerUserDeletion: (userId: string, startedAt: Date) => Promise<boolean>;
+  isAgentTriggerPrincipalActive: (userId: string) => Promise<boolean>;
   deleteUserById: (userId: string) => Promise<UserDeleteResult>;
   updateUserPlugins: (
     userId: string,
@@ -123,6 +137,10 @@ export function createUserMethods(
     action: 'install' | 'uninstall',
   ) => Promise<IUser | null>;
   toggleUserMemories: (userId: string, memoriesEnabled: boolean) => Promise<IUser | null>;
+  updateUserStatefulCodeEnvironment: (
+    userId: string,
+    environment: StatefulCodeEnvironment,
+  ) => Promise<IUser | null>;
 } {
   /**
    * Normalizes email fields in search criteria to lowercase and trimmed.
@@ -296,28 +314,45 @@ export function createUserMethods(
 
   /**
    * Atomically records terms acceptance for a user.
-   * Sets termsAccepted and, only when no timestamp is already stored, stamps
-   * termsAcceptedAt with the server time so the first acceptance within a terms
-   * cycle is preserved across concurrent or repeated requests.
+   * A null-guarded claim stamps termsAcceptedAt only when no timestamp is
+   * already stored (explicit null from the schema default, a missing legacy
+   * field, or a terms reset), so the first acceptance within a terms cycle is
+   * preserved across concurrent or repeated requests. The repeat-acceptance
+   * fallback is guarded by the exact complement (a non-null timestamp) so it
+   * can never resurrect termsAccepted into a cycle that config/reset-terms.js
+   * started between the two updates; when both guards miss because a reset
+   * raced in, the claim retries and records a fresh stamped acceptance. Plain
+   * updates are used instead of an aggregation pipeline with $$NOW, which
+   * Amazon DocumentDB rejects.
    */
   async function acceptTerms(userId: string): Promise<IUser | null> {
     const User = mongoose.models.User;
-    const updated = await User.findByIdAndUpdate(
-      userId,
-      [
-        {
-          $set: {
-            termsAccepted: true,
-            termsAcceptedAt: { $ifNull: ['$termsAcceptedAt', '$$NOW'] },
-          },
-        },
-      ],
-      { new: true, runValidators: true },
-    ).lean<IUser>();
-    if (updated) {
-      await invalidateAuthUserDocCache(userId);
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const firstAcceptance = await User.findOneAndUpdate(
+        { _id: userId, termsAcceptedAt: null },
+        { $set: { termsAccepted: true, termsAcceptedAt: new Date() } },
+        { new: true, runValidators: true },
+      ).lean<IUser>();
+      if (firstAcceptance) {
+        await invalidateAuthUserDocCache(userId);
+        return firstAcceptance;
+      }
+      const reacceptance = await User.findOneAndUpdate(
+        { _id: userId, termsAcceptedAt: { $ne: null } },
+        { $set: { termsAccepted: true } },
+        { new: true, runValidators: true },
+      ).lean<IUser>();
+      if (reacceptance) {
+        await invalidateAuthUserDocCache(userId);
+        return reacceptance;
+      }
+      const exists = await User.exists({ _id: userId });
+      if (!exists) {
+        return null;
+      }
     }
-    return updated;
+    return null;
   }
 
   /**
@@ -351,6 +386,70 @@ export function createUserMethods(
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new Error('Error deleting user: ' + errorMessage);
     }
+  }
+
+  /** Establishes the durable admission fence used while account deletion drains triggers. */
+  async function beginAgentTriggerUserDeletion(
+    userId: string,
+    startedAt: Date,
+  ): Promise<'acquired' | 'in_progress' | 'missing'> {
+    if (!(startedAt instanceof Date) || !Number.isFinite(startedAt.getTime())) {
+      throw new TypeError('startedAt must be a valid Date');
+    }
+    const User = mongoose.models.User;
+    const result = await User.updateOne(
+      { _id: userId, agentTriggerDeletionStartedAt: { $exists: false } },
+      { $set: { agentTriggerDeletionStartedAt: startedAt } },
+    );
+    if (result.modifiedCount === 1) {
+      await invalidateAuthUserDocCache(userId);
+      return 'acquired';
+    }
+    return (await User.exists({ _id: userId })) == null ? 'missing' : 'in_progress';
+  }
+
+  /** Replaces an abandoned fence only for an operator-confirmed offline deployment.
+   * Normal request paths must never call this: age alone cannot prove the prior owner died. */
+  async function recoverStaleAgentTriggerUserDeletion(
+    userId: string,
+    recoveredAt: Date,
+  ): Promise<'acquired' | 'in_progress' | 'missing'> {
+    if (!(recoveredAt instanceof Date) || !Number.isFinite(recoveredAt.getTime())) {
+      throw new TypeError('recoveredAt must be a valid Date');
+    }
+    const User = mongoose.models.User;
+    const staleBefore = new Date(recoveredAt.getTime() - USER_DELETION_FENCE_STALE_MS);
+    const result = await User.updateOne(
+      { _id: userId, agentTriggerDeletionStartedAt: { $lte: staleBefore } },
+      { $set: { agentTriggerDeletionStartedAt: recoveredAt } },
+    );
+    if (result.modifiedCount === 1) {
+      await invalidateAuthUserDocCache(userId);
+      return 'acquired';
+    }
+    return (await User.exists({ _id: userId })) == null ? 'missing' : 'in_progress';
+  }
+
+  /** Releases only the account-deletion attempt that owns this exact fence. */
+  async function cancelAgentTriggerUserDeletion(userId: string, startedAt: Date): Promise<boolean> {
+    const User = mongoose.models.User;
+    const result = await User.updateOne(
+      { _id: userId, agentTriggerDeletionStartedAt: startedAt },
+      { $unset: { agentTriggerDeletionStartedAt: 1 } },
+    );
+    if (result.modifiedCount === 1) {
+      await invalidateAuthUserDocCache(userId);
+      return true;
+    }
+    return false;
+  }
+
+  async function isAgentTriggerPrincipalActive(userId: string): Promise<boolean> {
+    const User = mongoose.models.User;
+    return (
+      (await User.exists({ _id: userId, agentTriggerDeletionStartedAt: { $exists: false } })) !=
+      null
+    );
   }
 
   /**
@@ -404,6 +503,22 @@ export function createUserMethods(
       new: true,
       runValidators: true,
     }).lean<IUser>();
+    if (updated) {
+      await invalidateAuthUserDocCache(userId);
+    }
+    return updated;
+  }
+
+  async function updateUserStatefulCodeEnvironment(
+    userId: string,
+    environment: StatefulCodeEnvironment,
+  ): Promise<IUser | null> {
+    const User = mongoose.models.User;
+    const updated = await User.findByIdAndUpdate(
+      userId,
+      { $set: { 'personalization.statefulCodeEnvironment': environment } },
+      { new: true, runValidators: true },
+    ).lean<IUser>();
     if (updated) {
       await invalidateAuthUserDocCache(userId);
     }
@@ -467,6 +582,7 @@ export function createUserMethods(
       termsAccepted?: boolean;
       personalization?: {
         memories?: boolean;
+        statefulCodeEnvironment?: import('librechat-data-provider').StatefulCodeEnvironment;
       };
       favorites?: import('librechat-data-provider').TUserFavorite[];
       skillStates?: Record<string, boolean>;
@@ -587,9 +703,14 @@ export function createUserMethods(
     searchUsers,
     getUserById,
     generateToken,
+    beginAgentTriggerUserDeletion,
+    recoverStaleAgentTriggerUserDeletion,
+    cancelAgentTriggerUserDeletion,
+    isAgentTriggerPrincipalActive,
     deleteUserById,
     updateUserPlugins,
     toggleUserMemories,
+    updateUserStatefulCodeEnvironment,
   };
 }
 

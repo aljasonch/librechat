@@ -7,6 +7,7 @@ import {
   ContentTypes,
   ToolCallTypes,
   getNonEmptyValue,
+  getRunStepDurationMs,
 } from 'librechat-data-provider';
 import type {
   Agents,
@@ -53,15 +54,42 @@ type TStepEvent =
   | { event: StepEvents.ON_REASONING_DELTA; data: Agents.ReasoningDeltaEvent }
   | { event: StepEvents.ON_RUN_STEP_DELTA; data: Agents.RunStepDeltaEvent }
   | { event: StepEvents.ON_RUN_STEP_COMPLETED; data: { result: Agents.ToolEndEvent } }
+  | { event: StepEvents.ON_RUN_STEP_CLOSED; data: Agents.RunStepClosedEvent }
   | { event: StepEvents.ON_SUMMARIZE_START; data: Agents.SummarizeStartEvent }
   | { event: StepEvents.ON_SUMMARIZE_DELTA; data: Agents.SummarizeDeltaEvent }
   | { event: StepEvents.ON_SUMMARIZE_COMPLETE; data: Agents.SummarizeCompleteEvent }
   | { event: StepEvents.ON_SUBAGENT_UPDATE; data: SubagentUpdateEvent }
   | { event: StepEvents.ON_SANDBOX_STARTING; data: SandboxStartingEvent };
 
-type MessageDeltaUpdate = { type: ContentTypes.TEXT; text: string; tool_call_ids?: string[] };
+type MessageDeltaUpdate = {
+  type: ContentTypes.TEXT;
+  text: string;
+  tool_call_ids?: string[];
+  phase?: 'commentary' | 'final_answer';
+};
 
 type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
+
+/** Starts a fresh label-revision domain when a different reasoning step
+ * reuses or folds into an existing THINK slot. The step id is stamped before
+ * the first generated title so compacted resume snapshots can still correlate
+ * later label events by identity rather than relying only on a sparse index. */
+function prepareReasoningPartForStep(message: TMessage, index: number, stepId: string): TMessage {
+  const current = message.content?.[index];
+  if (current?.type !== ContentTypes.THINK || current.reasoning_label_step_id === stepId) {
+    return message;
+  }
+  const nextPart = { ...current };
+  delete nextPart.reasoning_label;
+  delete nextPart.reasoning_label_attempts;
+  delete nextPart.reasoning_label_submitted_chars;
+  delete nextPart.reasoning_label_revision;
+  delete nextPart.reasoning_label_status;
+  nextPart.reasoning_label_step_id = stepId;
+  const nextContent = [...(message.content ?? [])];
+  nextContent[index] = nextPart;
+  return { ...message, content: nextContent };
+}
 
 type AllContentTypes =
   | ContentTypes.TEXT
@@ -331,27 +359,40 @@ export default function useStepHandler({
 
   /**
    * Calculate content index for a run step.
-   * For edited content scenarios, offset by initialContent length.
+   *
+   * Takes the edit-prefix OFFSET rather than the prefix array: after a resume
+   * sync the live array no longer describes the retained prefix, so deriving
+   * the offset here from its length would disagree with the offset every
+   * other event path applies.
    */
   const calculateContentIndex = useCallback(
     (
       serverIndex: number,
-      initialContent: TMessageContentParts[],
+      editPrefixOffset: number,
       incomingContentType: string,
       existingContent?: TMessageContentParts[],
+      incomingPhase?: 'commentary' | 'final_answer',
     ): number => {
       /** Only apply -1 adjustment for TEXT or THINK types when they match existing content */
       if (
-        initialContent.length > 0 &&
+        editPrefixOffset > 0 &&
         (incomingContentType === ContentTypes.TEXT || incomingContentType === ContentTypes.THINK)
       ) {
-        const targetIndex = serverIndex + initialContent.length - 1;
-        const existingType = existingContent?.[targetIndex]?.type;
-        if (existingType === incomingContentType) {
+        const targetIndex = serverIndex + editPrefixOffset - 1;
+        const existingPart = existingContent?.[targetIndex];
+        const existingType = existingPart?.type;
+        const existingPhase =
+          existingPart?.type === ContentTypes.TEXT ? existingPart.phase : undefined;
+        /** Match final assembly: phased and legacy/unphased text cannot share
+         *  a content part because the phase controls client grouping. */
+        const phaseCompatible =
+          incomingContentType !== ContentTypes.TEXT ||
+          (incomingPhase ?? null) === (existingPhase ?? null);
+        if (existingType === incomingContentType && phaseCompatible) {
           return targetIndex;
         }
       }
-      return serverIndex + initialContent.length;
+      return serverIndex + editPrefixOffset;
     },
     [],
   );
@@ -395,7 +436,7 @@ export default function useStepHandler({
      * — the store-level strip on answer submit can't reach those.
      */
     if (isAskUserQuestionPart(updatedContent[index])) {
-      updatedContent = updatedContent.filter((part) => !isAskUserQuestionPart(part));
+      updatedContent[index] = undefined;
     } else if (updatedContent.some(isAnsweredAskUserQuestionPart)) {
       /**
        * An ALREADY-ANSWERED card the resumed segment streams around rather than
@@ -404,9 +445,13 @@ export default function useStepHandler({
        * cached copy — which still holds the card the answer-submit stripped from
        * the store — gets written back, reopening the popover with its options
        * locked. Only cards the user actually answered are dropped, so an event
-       * racing a still-live pause can't take its card down.
+       * racing a still-live pause can't take its card down. Preserve sparse
+       * absolute indices: compacting holes can move an older tool call into a
+       * text slot until the terminal snapshot repairs the rendered order.
        */
-      updatedContent = updatedContent.filter((part) => !isAnsweredAskUserQuestionPart(part));
+      updatedContent = updatedContent.map((part) =>
+        isAnsweredAskUserQuestionPart(part) ? undefined : part,
+      );
     }
 
     if (!updatedContent[index] && contentType !== ContentTypes.TOOL_CALL) {
@@ -431,9 +476,12 @@ export default function useStepHandler({
       typeof contentPart.text === 'string'
     ) {
       const currentContent = updatedContent[index] as MessageDeltaUpdate;
+      const incomingContent = contentPart as MessageDeltaUpdate;
+      const phase = incomingContent.phase ?? currentContent.phase;
       const update: MessageDeltaUpdate = {
         type: ContentTypes.TEXT,
-        text: (currentContent.text || '') + contentPart.text,
+        text: (currentContent.text || '') + incomingContent.text,
+        ...(phase != null && { phase }),
       };
 
       if ('tool_call_ids' in contentPart && contentPart.tool_call_ids != null) {
@@ -458,6 +506,7 @@ export default function useStepHandler({
     ) {
       const currentContent = updatedContent[index] as ReasoningDeltaUpdate;
       const update: ReasoningDeltaUpdate = {
+        ...currentContent,
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
       };
@@ -601,15 +650,28 @@ export default function useStepHandler({
           return candidateMessages;
         }
 
-        const responseIndex = candidateMessages.findIndex(
-          (message) => message.messageId === responseMessageId,
-        );
-        if (responseIndex < 0) {
+        /** Insert before the row's first CHILD as well as before the response
+         *  row: abandoned responses from preempted attempts are children of
+         *  this user message and may already sit in the list. Landing the
+         *  parent after them orders children before their parent, which the
+         *  message tree renders as phantom root branches (a folded thread). */
+        let insertIndex = candidateMessages.length;
+        for (let i = 0; i < candidateMessages.length; i++) {
+          const message = candidateMessages[i];
+          if (
+            message.messageId === responseMessageId ||
+            message.parentMessageId === userMessage.messageId
+          ) {
+            insertIndex = i;
+            break;
+          }
+        }
+        if (insertIndex >= candidateMessages.length) {
           return [...candidateMessages, userMessage as TMessage];
         }
 
         const nextMessages = [...candidateMessages];
-        nextMessages.splice(responseIndex, 0, userMessage as TMessage);
+        nextMessages.splice(insertIndex, 0, userMessage as TMessage);
         return nextMessages;
       };
       const getResponseBaseMessages = (
@@ -696,10 +758,33 @@ export default function useStepHandler({
         lastAnnouncementTimeRef.current = currentTime;
       }
 
+      /**
+       * Index offset for an edited resubmission: the server indexes only the
+       * NEW content, so incoming indices shift past the prefix the client
+       * kept.
+       *
+       * Reads the length CAPTURED when the submission was built rather than
+       * the live `initialResponse.content` array, because a resume sync
+       * REPLACES that array with the server's completion-local snapshot —
+       * whose length describes the new generation, not the retained prefix.
+       * They are equal until a reconnect, so the non-resumed path is
+       * unaffected.
+       *
+       * `editPrefixCleared` means that sync also replaced the RENDERED
+       * content: the prefix is gone from the message and server indices are
+       * already absolute, so any offset would write past the end. Activity
+       * labels honor the same flag — both must agree, or a batch's tool
+       * cards and its header land in different index spaces.
+       *
+       * `initialContent` stays the live array: it seeds a response that is
+       * not in the map yet, and post-sync the seeding path correctly falls
+       * back to the rendered content instead.
+       */
       let initialContent: TMessageContentParts[] = [];
-      // For editedContent scenarios, use the initial response content for index offsetting
-      if (submission?.editedContent != null) {
+      let editPrefixOffset = 0;
+      if (submission?.editedContent != null && submission?.editPrefixCleared !== true) {
         initialContent = submission?.initialResponse?.content ?? initialContent;
+        editPrefixOffset = submission?.editPrefixLength ?? initialContent.length;
       }
 
       if (stepEvent.event === StepEvents.ON_RUN_STEP) {
@@ -716,8 +801,8 @@ export default function useStepHandler({
 
         stepMap.current.set(runStep.id, runStep);
 
-        // Calculate content index - use server index, offset by initialContent for edit scenarios
-        const contentIndex = runStep.index + initialContent.length;
+        // Calculate content index - use server index, offset by the retained edit prefix
+        const contentIndex = runStep.index + editPrefixOffset;
 
         let response = messageMap.current.get(responseMessageId);
 
@@ -763,12 +848,9 @@ export default function useStepHandler({
           // Ensure userMessage is present (multi-tab: Tab 2 may not have it yet).
           // Regenerate reuses an existing user turn; its submission userMessage is only
           // a transport placeholder and must not become a new visible branch.
-          if (
-            !submission.isRegenerate &&
-            !updatedMessages.some((m) => m.messageId === userMessage.messageId)
-          ) {
-            updatedMessages = [...updatedMessages, userMessage as TMessage];
-          }
+          // (`ensureUserMessagePresent` no-ops for regenerate and inserts in
+          // parent-before-children order otherwise.)
+          updatedMessages = ensureUserMessagePresent(updatedMessages, responseMessageId);
 
           setMessages([...updatedMessages, response]);
         }
@@ -857,7 +939,7 @@ export default function useStepHandler({
         const response = messageMap.current.get(responseMessageId);
         if (response) {
           // Agent updates don't need index adjustment
-          const currentIndex = agent_update.index + initialContent.length;
+          const currentIndex = agent_update.index + editPrefixOffset;
           // Agent updates carry their own agentId - use default groupId if agentId is present
           const agentUpdateMeta: ContentMetadata | undefined = agent_update.agentId
             ? { agentId: agent_update.agentId, groupId: 1 }
@@ -894,29 +976,66 @@ export default function useStepHandler({
 
         const response = messageMap.current.get(responseMessageId);
         if (response && messageDelta.delta.content) {
-          const contentPart = Array.isArray(messageDelta.delta.content)
-            ? messageDelta.delta.content[0]
-            : messageDelta.delta.content;
+          /** A delta may carry several parts (e.g. Google server-side tool
+           *  chunks) — every entry must be applied, in order, or streamed
+           *  text is silently dropped. */
+          const contentParts = Array.isArray(messageDelta.delta.content)
+            ? messageDelta.delta.content
+            : [messageDelta.delta.content];
 
-          if (contentPart == null) {
-            return;
+          let updatedResponse = response;
+          let hasUpdate = false;
+          for (const contentPart of contentParts) {
+            if (contentPart == null) {
+              continue;
+            }
+            const messageCreation =
+              runStep.stepDetails.type === StepTypes.MESSAGE_CREATION
+                ? (runStep.stepDetails.message_creation as {
+                    phase?: 'commentary' | 'final_answer';
+                  })
+                : undefined;
+            const phase = messageCreation?.phase;
+            const phasedContentPart =
+              contentPart.type === ContentTypes.TEXT &&
+              (phase === 'commentary' || phase === 'final_answer')
+                ? { ...contentPart, phase }
+                : contentPart;
+            const currentIndex = calculateContentIndex(
+              runStep.index,
+              editPrefixOffset,
+              phasedContentPart.type || '',
+              updatedResponse.content,
+              phase,
+            );
+            if (
+              submission != null &&
+              runStep.index === 0 &&
+              editPrefixOffset > 0 &&
+              currentIndex === editPrefixOffset - 1
+            ) {
+              submission.editPrefixFirstPartFolded = true;
+            }
+            if (phasedContentPart.type === ContentTypes.THINK) {
+              updatedResponse = prepareReasoningPartForStep(
+                updatedResponse,
+                currentIndex,
+                messageDelta.id,
+              );
+            }
+            updatedResponse = updateContent(
+              updatedResponse,
+              currentIndex,
+              phasedContentPart,
+              false,
+              getStepMetadata(runStep),
+            );
+            hasUpdate = true;
           }
-
-          const currentIndex = calculateContentIndex(
-            runStep.index,
-            initialContent,
-            contentPart.type || '',
-            response.content,
-          );
-          const updatedResponse = updateContent(
-            response,
-            currentIndex,
-            contentPart,
-            false,
-            getStepMetadata(runStep),
-          );
-          messageMap.current.set(responseMessageId, updatedResponse);
-          scheduleCoalescedMessagesFlush(responseMessageId);
+          if (hasUpdate) {
+            messageMap.current.set(responseMessageId, updatedResponse);
+            scheduleCoalescedMessagesFlush(responseMessageId);
+          }
         }
       } else if (stepEvent.event === StepEvents.ON_REASONING_DELTA) {
         const reasoningDelta = stepEvent.data;
@@ -936,29 +1055,50 @@ export default function useStepHandler({
 
         const response = messageMap.current.get(responseMessageId);
         if (response && reasoningDelta.delta.content != null) {
-          const contentPart = Array.isArray(reasoningDelta.delta.content)
-            ? reasoningDelta.delta.content[0]
-            : reasoningDelta.delta.content;
+          /** Same multi-part contract as message deltas: Google server-side
+           *  tool chunks emit several think entries in one delta. */
+          const contentParts = Array.isArray(reasoningDelta.delta.content)
+            ? reasoningDelta.delta.content
+            : [reasoningDelta.delta.content];
 
-          if (contentPart == null) {
-            return;
+          let updatedResponse = response;
+          let hasUpdate = false;
+          for (const contentPart of contentParts) {
+            if (contentPart == null) {
+              continue;
+            }
+            const currentIndex = calculateContentIndex(
+              runStep.index,
+              editPrefixOffset,
+              contentPart.type || '',
+              updatedResponse.content,
+            );
+            if (
+              submission != null &&
+              runStep.index === 0 &&
+              editPrefixOffset > 0 &&
+              currentIndex === editPrefixOffset - 1
+            ) {
+              submission.editPrefixFirstPartFolded = true;
+            }
+            updatedResponse = prepareReasoningPartForStep(
+              updatedResponse,
+              currentIndex,
+              reasoningDelta.id,
+            );
+            updatedResponse = updateContent(
+              updatedResponse,
+              currentIndex,
+              contentPart,
+              false,
+              getStepMetadata(runStep),
+            );
+            hasUpdate = true;
           }
-
-          const currentIndex = calculateContentIndex(
-            runStep.index,
-            initialContent,
-            contentPart.type || '',
-            response.content,
-          );
-          const updatedResponse = updateContent(
-            response,
-            currentIndex,
-            contentPart,
-            false,
-            getStepMetadata(runStep),
-          );
-          messageMap.current.set(responseMessageId, updatedResponse);
-          scheduleCoalescedMessagesFlush(responseMessageId);
+          if (hasUpdate) {
+            messageMap.current.set(responseMessageId, updatedResponse);
+            scheduleCoalescedMessagesFlush(responseMessageId);
+          }
         }
       } else if (stepEvent.event === StepEvents.ON_RUN_STEP_DELTA) {
         const runStepDelta = stepEvent.data;
@@ -1001,8 +1141,8 @@ export default function useStepHandler({
               contentPart.tool_call.expires_at = runStepDelta.delta.expires_at;
             }
 
-            // Use server's index, offset by initialContent for edit scenarios
-            const currentIndex = runStep.index + initialContent.length;
+            // Use server's index, offset by the retained edit prefix
+            const currentIndex = runStep.index + editPrefixOffset;
             updatedResponse = updateContent(
               updatedResponse,
               currentIndex,
@@ -1050,8 +1190,8 @@ export default function useStepHandler({
             tool_call: result.tool_call,
           };
 
-          // Use server's index, offset by initialContent for edit scenarios
-          const currentIndex = runStep.index + initialContent.length;
+          // Use server's index, offset by the retained edit prefix
+          const currentIndex = runStep.index + editPrefixOffset;
           updatedResponse = updateContent(
             updatedResponse,
             currentIndex,
@@ -1067,6 +1207,66 @@ export default function useStepHandler({
             }),
           );
         }
+      } else if (stepEvent.event === StepEvents.ON_RUN_STEP_CLOSED) {
+        const closed = stepEvent.data;
+        const runStep = stepMap.current.get(closed.id);
+        let responseMessageId = runStep?.runId ?? '';
+        if (responseMessageId === Constants.USE_PRELIM_RESPONSE_MESSAGE_ID) {
+          responseMessageId = submission?.initialResponse?.messageId ?? '';
+          parentMessageId = submission?.initialResponse?.parentMessageId ?? '';
+        }
+
+        /**
+         * A closure for a step this client never saw opened is not an error
+         * worth surfacing — it happens on reconnect, where the replay may
+         * start after the step was created.
+         */
+        if (!runStep || !responseMessageId) {
+          return;
+        }
+
+        const response = messageMap.current.get(responseMessageId);
+        if (!response) {
+          return;
+        }
+
+        const currentIndex = runStep.index + editPrefixOffset;
+        const existing = response.content?.[currentIndex];
+        /**
+         * Only tool calls render a running state, so only they need the
+         * terminal status. Leaving other part types untouched keeps this from
+         * disturbing text or reasoning content.
+         */
+        if (!existing || existing.type !== ContentTypes.TOOL_CALL) {
+          return;
+        }
+
+        const existingToolCall = existing[ContentTypes.TOOL_CALL];
+        if (!existingToolCall) {
+          return;
+        }
+
+        /** Spread conditionally so an unknowable duration leaves any value the
+         *  server already stamped in place, rather than overwriting it with
+         *  `undefined`. */
+        const durationMs = getRunStepDurationMs(closed);
+        const updatedContent = [...(response.content ?? [])];
+        updatedContent[currentIndex] = {
+          ...existing,
+          [ContentTypes.TOOL_CALL]: {
+            ...existingToolCall,
+            runStepStatus: closed.status,
+            ...(durationMs != null && { runStepDurationMs: durationMs }),
+          },
+        };
+
+        const updatedResponse = { ...response, content: updatedContent };
+        messageMap.current.set(responseMessageId, updatedResponse);
+        setMessages(
+          mergeResponseMessage(messages, updatedResponse, responseMessageId, {
+            ensureUserMessage: true,
+          }),
+        );
       } else if (stepEvent.event === StepEvents.ON_SANDBOX_STARTING) {
         setSandboxStarting(stepEvent.data.tool_call_id);
       } else if (stepEvent.event === StepEvents.ON_SUBAGENT_UPDATE) {
@@ -1096,7 +1296,7 @@ export default function useStepHandler({
             summarizing: true,
           };
 
-          const contentIndex = runStep.index + initialContent.length;
+          const contentIndex = runStep.index + editPrefixOffset;
           const updatedResponse = updateContent(
             response,
             contentIndex,

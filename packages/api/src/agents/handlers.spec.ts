@@ -1,3 +1,8 @@
+jest.mock('./prewarm', () => ({
+  markSandboxReady: jest.fn(),
+}));
+
+import { Readable } from 'stream';
 import { Constants } from '@librechat/agents';
 import { logger } from '@librechat/data-schemas';
 import type {
@@ -5,7 +10,9 @@ import type {
   ToolExecuteResult,
   ToolCallRequest,
 } from '@librechat/agents';
+import type { CodeExecutionContext } from './execution';
 import { createToolExecuteHandler, ToolExecuteOptions } from './handlers';
+import { markSandboxReady } from './prewarm';
 
 function createMockTool(
   name: string,
@@ -553,6 +560,48 @@ describe('createToolExecuteHandler', () => {
       return createToolExecuteHandler({ loadTools, getSkillByName });
     }
 
+    /** Skill with one bundled file plus every dep the priming gate requires,
+     *  so the handler actually attempts the batch upload. */
+    function createPrimingSkillHandler(
+      skillName: string,
+      batchUploadCodeEnvFiles: NonNullable<ToolExecuteOptions['batchUploadCodeEnvFiles']>,
+    ) {
+      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
+        loadedTools: [],
+        configurable: {
+          accessibleSkillIds: skillsInScope(),
+          codeEnvAvailable: true,
+          req: { user: { id: 'user-1' } },
+        },
+      }));
+      const getSkillByName: ToolExecuteOptions['getSkillByName'] = jest.fn(async () => ({
+        _id: `${skillName}-id` as unknown as never,
+        name: skillName,
+        body: 'skill body',
+        fileCount: 1,
+        version: 1,
+      }));
+      const listSkillFiles: ToolExecuteOptions['listSkillFiles'] = jest.fn(async () => [
+        {
+          relativePath: 'references/style.md',
+          filename: 'style.md',
+          filepath: `/storage/${skillName}/references/style.md`,
+          source: 's3',
+          bytes: 256,
+        },
+      ]);
+      const getStrategyFunctions: ToolExecuteOptions['getStrategyFunctions'] = jest.fn(() => ({
+        getDownloadStream: jest.fn(async () => Readable.from(Buffer.from(''))),
+      }));
+      return createToolExecuteHandler({
+        loadTools,
+        getSkillByName,
+        listSkillFiles,
+        getStrategyFunctions,
+        batchUploadCodeEnvFiles,
+      });
+    }
+
     it('rejects with a clear error when the named skill has disableModelInvocation=true', async () => {
       const getSkillByName = jest.fn(async () => ({
         _id: 'skill-id' as unknown as never,
@@ -684,6 +733,63 @@ describe('createToolExecuteHandler', () => {
         | { preferUserInvocable?: boolean }
         | undefined;
       expect(callOptions).not.toHaveProperty('preferUserInvocable', true);
+    });
+
+    it('appends an unavailability note when file priming fails, so the model avoids dead sandbox paths', async () => {
+      const batchUploadCodeEnvFiles = jest.fn(async () => {
+        throw new Error('Request failed with status code 429');
+      });
+      const handler = createPrimingSkillHandler('note-fail-skill', batchUploadCodeEnvFiles);
+
+      const [result] = await invokeHandler(handler, [
+        {
+          id: 'call_prime_fail',
+          name: Constants.SKILL_TOOL,
+          args: { skillName: 'note-fail-skill' },
+        },
+      ]);
+
+      /* The skill body still loads (instructions inject regardless), but the
+       * tool result must say the bundled files never reached the sandbox. */
+      expect(result.status).toBe('success');
+      expect(result.content).toContain('could not be loaded into the code environment');
+      expect(result.content).toContain('/mnt/data/skills/note-fail-skill/');
+      expect(result.content).toContain('read_file');
+      expect(result.artifact).toBeUndefined();
+    });
+
+    it('omits the unavailability note when file priming succeeds', async () => {
+      const batchUploadCodeEnvFiles = jest.fn(async () => ({
+        storage_session_id: 'session-ok',
+        files: [
+          { fileId: 'file-ok', filename: 'skills/note-ok-skill/references/style.md' },
+          { fileId: 'file-skillmd', filename: 'skills/note-ok-skill/SKILL.md' },
+        ],
+      }));
+      const handler = createPrimingSkillHandler('note-ok-skill', batchUploadCodeEnvFiles);
+
+      const [result] = await invokeHandler(handler, [
+        {
+          id: 'call_prime_ok',
+          name: Constants.SKILL_TOOL,
+          args: { skillName: 'note-ok-skill' },
+        },
+      ]);
+
+      expect(result.status).toBe('success');
+      expect(result.content).not.toContain('could not be loaded');
+      expect(result.artifact).toEqual(
+        expect.objectContaining({
+          session_id: 'session-ok',
+          files: [
+            expect.objectContaining({
+              id: 'file-ok',
+              name: 'skills/note-ok-skill/references/style.md',
+              kind: 'skill',
+            }),
+          ],
+        }),
+      );
     });
 
     it("read_file pins lookup to the primed skill's _id when manually invoked this turn (no shadowing on collision)", async () => {
@@ -1095,7 +1201,7 @@ describe('createToolExecuteHandler', () => {
           args: {
             path: 'skills/new-skill/SKILL.md',
             content:
-              '---\nname: new-skill\ndescription: Use for tests\ndisable-model-invocation: true\nallowed-tools:\n  - execute_code\n---\n# New skill\n',
+              '---\nname: new-skill\ndescription: Use for tests\ndisable-model-invocation: true\nAllowed-Tools:\n  - execute_code\n---\n# New skill\n',
           },
         },
       ]);
@@ -1119,6 +1225,79 @@ describe('createToolExecuteHandler', () => {
         }),
       );
       expect(grantSkillOwner).toHaveBeenCalledWith({ req, skillId: SKILL_ID });
+    });
+
+    it('rejects case-colliding recognized frontmatter keys in create_file', async () => {
+      const createSkill = jest.fn();
+      const handler = makeAuthoringHandler({
+        getSkillByName: jest.fn(async () => null),
+        createSkill: createSkill as unknown as ToolExecuteOptions['createSkill'],
+      });
+
+      const [result] = await invokeHandler(handler, [
+        {
+          id: 'call_create_collision_skill',
+          name: 'create_file',
+          args: {
+            path: 'skills/collision-skill/SKILL.md',
+            content:
+              '---\nname: collision-skill\ndescription: Use for collision tests\nallowed-tools:\n  - read_file\nAllowed-Tools:\n  - execute_code\n---\n# Collision skill\n',
+          },
+        },
+      ]);
+
+      expect(result.status).toBe('error');
+      expect(result.errorMessage).toContain('both resolve to "allowed-tools"');
+      expect(createSkill).not.toHaveBeenCalled();
+    });
+
+    it('surfaces skill validation warnings from create_file', async () => {
+      const createSkill = jest.fn(async () => ({
+        skill: {
+          _id: SKILL_ID,
+          name: 'warning-skill',
+          body: '# Warning skill',
+          version: 1,
+        },
+        warnings: [
+          {
+            field: 'frontmatter.triger',
+            code: 'UNKNOWN_KEY',
+            severity: 'warning' as const,
+            message: '"triger" is not a recognized frontmatter key and is stored as-is',
+          },
+        ],
+      }));
+      const handler = makeAuthoringHandler({
+        getSkillByName: jest.fn(async () => null),
+        createSkill,
+      });
+
+      const [result] = await invokeHandler(handler, [
+        {
+          id: 'call_create_warning_skill',
+          name: 'create_file',
+          args: {
+            path: 'skills/warning-skill/SKILL.md',
+            content:
+              '---\nname: warning-skill\ndescription: Use for warning tests\ntriger: manual\n---\n# Warning skill\n',
+          },
+        },
+      ]);
+
+      expect(result.status).toBe('success');
+      expect(result.content).toContain('Warnings:');
+      expect(result.content).toContain('frontmatter.triger [UNKNOWN_KEY]');
+      expect(result.artifact).toMatchObject({
+        warning_count: 1,
+        warnings: [
+          expect.objectContaining({
+            field: 'frontmatter.triger',
+            code: 'UNKNOWN_KEY',
+            severity: 'warning',
+          }),
+        ],
+      });
     });
 
     it('adds required SKILL.md frontmatter when create_file only provides markdown', async () => {
@@ -1771,6 +1950,65 @@ describe('createToolExecuteHandler', () => {
       );
     });
 
+    it('surfaces skill validation warnings from edit_file', async () => {
+      const oldBody = '---\nname: runtime-skill\ndescription: Use before\n---\n# Runtime skill\n';
+      const updatedBody =
+        '---\nname: runtime-skill\ndescription: Use after\ntriger: manual\n---\n# Runtime skill\n';
+      const updateSkill = jest.fn(async () => ({
+        status: 'updated' as const,
+        skill: {
+          _id: SKILL_ID,
+          name: 'runtime-skill',
+          body: updatedBody,
+          version: 2,
+        },
+        warnings: [
+          {
+            field: 'frontmatter.triger',
+            code: 'UNKNOWN_KEY',
+            severity: 'warning' as const,
+            message: '"triger" is not a recognized frontmatter key and is stored as-is',
+          },
+        ],
+      }));
+      const handler = makeAuthoringHandler({
+        getSkillByName: jest.fn(async () => ({
+          _id: SKILL_ID,
+          name: 'runtime-skill',
+          body: oldBody,
+          fileCount: 0,
+          version: 1,
+        })),
+        updateSkill,
+      });
+
+      const [result] = await invokeHandler(handler, [
+        {
+          id: 'call_edit_warning_skill',
+          name: 'edit_file',
+          args: {
+            path: 'skills/runtime-skill/SKILL.md',
+            old_text: 'description: Use before',
+            new_text: 'description: Use after\ntriger: manual',
+          },
+        },
+      ]);
+
+      expect(result.status).toBe('success');
+      expect(result.content).toContain('Warnings:');
+      expect(result.content).toContain('frontmatter.triger [UNKNOWN_KEY]');
+      expect(result.artifact).toMatchObject({
+        warning_count: 1,
+        warnings: [
+          expect.objectContaining({
+            field: 'frontmatter.triger',
+            code: 'UNKNOWN_KEY',
+            severity: 'warning',
+          }),
+        ],
+      });
+    });
+
     it('preserves block-scalar SKILL.md descriptions when editing skills', async () => {
       const oldBody = '---\nname: runtime-skill\ndescription: Use before\n---\n# Runtime skill\n';
       const updateSkill = jest.fn(async () => ({
@@ -2359,6 +2597,7 @@ describe('createToolExecuteHandler', () => {
       activeSkillNames?: Set<string>;
       skillPrimedIdsByName?: Record<string, string>;
       skillAuthoringAvailable?: boolean;
+      codeExecutionContext?: CodeExecutionContext;
       req?: unknown;
       readSandboxFile?: ToolExecuteOptions['readSandboxFile'];
       readSandboxImage?: ToolExecuteOptions['readSandboxImage'];
@@ -2374,6 +2613,7 @@ describe('createToolExecuteHandler', () => {
           activeSkillNames: params.activeSkillNames,
           skillPrimedIdsByName: params.skillPrimedIdsByName,
           skillAuthoringAvailable: params.skillAuthoringAvailable === true,
+          codeExecutionContext: params.codeExecutionContext,
         },
       }));
       return createToolExecuteHandler({
@@ -2412,6 +2652,102 @@ describe('createToolExecuteHandler', () => {
       });
       expect(result.status).toBe('success');
       expect(result.content).toContain('hello-world');
+    });
+
+    it('routes host file reads with the executing agent profile instead of a graph hint', async () => {
+      const readSandboxFile = jest.fn(async () => ({ content: 'stateful-data' }));
+      const handler = makeReadFileHandler({
+        codeEnvAvailable: true,
+        accessibleSkillIds: skillsInScope(),
+        codeExecutionContext: {
+          baseUrl: 'https://stateful-code.example.com',
+          codeSessionKey: 'execute_code:stateful:v1:user',
+          executionProfile: 'stateful',
+          runtimeSessionHint: 'v1:user',
+          statefulSessions: true,
+        },
+        readSandboxFile,
+      });
+
+      await invokeHandler(handler, [
+        {
+          id: 'call_profiled_read',
+          name: Constants.READ_FILE,
+          args: { path: '/mnt/data/sentinel.txt' },
+          runtimeSessionHint: 'legacy-graph-hint',
+        } as unknown as ToolCallRequest,
+      ]);
+
+      expect(readSandboxFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          codeApiBaseUrl: 'https://stateful-code.example.com',
+          executionProfile: 'stateful',
+          runtime_session_hint: 'v1:user',
+        }),
+      );
+      expect(readSandboxFile).not.toHaveBeenCalledWith(
+        expect.objectContaining({ runtime_session_hint: 'legacy-graph-hint' }),
+      );
+    });
+
+    it('marks an actual sandbox read warm without marking skill-backed reads', async () => {
+      const readSandboxFile = jest.fn(async () => ({ content: 'stateful-data' }));
+      const context: CodeExecutionContext = {
+        baseUrl: 'https://stateful-code.example.com',
+        codeSessionKey: 'execute_code:stateful:v2:user:abc',
+        executionProfile: 'stateful',
+        runtimeSessionHint: 'v2:user:abc',
+        statefulSessions: true,
+      };
+      const handler = makeReadFileHandler({
+        codeEnvAvailable: true,
+        accessibleSkillIds: skillsInScope(),
+        codeExecutionContext: context,
+        readSandboxFile,
+      });
+
+      const [result] = await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+        handler.handle('on_tool_execute', {
+          toolCalls: [
+            {
+              id: 'call_warm_read',
+              name: Constants.READ_FILE,
+              args: { path: '/mnt/data/sentinel.txt' },
+            },
+          ],
+          metadata: { thread_id: 'conversation-1' },
+          resolve,
+          reject,
+        } as ToolExecuteBatchRequest);
+      });
+
+      expect(result.status).toBe('success');
+      expect(markSandboxReady).toHaveBeenCalledWith('v2:user:abc');
+      expect(markSandboxReady).toHaveBeenCalledWith('conversation-1');
+
+      jest.mocked(markSandboxReady).mockClear();
+      const skillHandler = makeReadFileHandler({
+        codeEnvAvailable: true,
+        accessibleSkillIds: skillsInScope(),
+        activeSkillNames: new Set(['docs']),
+        codeExecutionContext: context,
+        getSkillByName: jest.fn(async () => ({
+          _id: '507f1f77bcf86cd799439011' as never,
+          name: 'docs',
+          body: '# Docs',
+          fileCount: 0,
+          version: 1,
+        })),
+      });
+
+      await invokeHandler(skillHandler, [
+        {
+          id: 'call_skill_read',
+          name: Constants.READ_FILE,
+          args: { path: 'docs/SKILL.md' },
+        },
+      ]);
+      expect(markSandboxReady).not.toHaveBeenCalled();
     });
 
     it('returns a clear error for /mnt/data/ when codeEnv is not available', async () => {

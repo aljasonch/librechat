@@ -10,8 +10,15 @@ const { findToken, createToken, updateToken, deleteTokens } = require('~/models'
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
 const { exchangeOboToken } = require('~/server/services/OboTokenService');
 const { createOboTrustChecker } = require('~/server/services/OboPolicyService');
-const { updateMCPServerTools } = require('~/server/services/Config');
+const { getMCPToolsCacheGeneration, updateMCPServerTools } = require('~/server/services/Config');
 const { getLogStores } = require('~/cache');
+
+const MCP_REINITIALIZE_FAILURE_REASONS = {
+  UNREACHABLE: 'unreachable',
+  MISSING_CUSTOM_USER_VARS: 'missing_custom_user_vars',
+  OAUTH_REQUIRED: 'oauth_required',
+  INITIALIZATION_FAILED: 'initialization_failed',
+};
 
 /**
  * Reinitializes an MCP server connection and discovers available tools.
@@ -56,7 +63,10 @@ async function reinitMCPServer({
   let tools = null;
   let oauthRequired = false;
   let oauthUrl = null;
+  let oauthExpiresAt;
   let ephemeralServer = false;
+  let publicationGeneration;
+  let publicationRevision;
 
   try {
     const registry = getMCPServersRegistry();
@@ -72,6 +82,7 @@ async function reinitMCPServer({
           availableTools: null,
           success: false,
           message: `MCP server '${serverName}' is still unreachable`,
+          failureReason: MCP_REINITIALIZE_FAILURE_REASONS.UNREACHABLE,
           oauthRequired: false,
           serverName,
           oauthUrl: null,
@@ -94,6 +105,7 @@ async function reinitMCPServer({
             availableTools: null,
             success: false,
             message: `MCP server '${serverName}' is still unreachable`,
+            failureReason: MCP_REINITIALIZE_FAILURE_REASONS.UNREACHABLE,
             oauthRequired: false,
             serverName,
             oauthUrl: null,
@@ -118,6 +130,8 @@ async function reinitMCPServer({
         message: `MCP server '${serverName}' requires user-provided variable(s) [${missingUserVars.join(
           ', ',
         )}] which are not set`,
+        failureReason: MCP_REINITIALIZE_FAILURE_REASONS.MISSING_CUSTOM_USER_VARS,
+        missingUserVars,
         oauthRequired: false,
         serverName,
         oauthUrl: null,
@@ -155,11 +169,24 @@ async function reinitMCPServer({
     const mcpManager = getMCPManager();
     const tokenMethods = { findToken, updateToken, createToken, deleteTokens };
 
+    if (!ephemeralServer) {
+      publicationGeneration = await getMCPToolsCacheGeneration({
+        userId: user.id,
+        serverName,
+      });
+    }
+
     const oauthStart =
       _oauthStart ??
-      (async (authURL) => {
+      (async (authURL, options) => {
         logger.info(`[MCP Reinitialize] OAuth URL received for ${serverName}`);
+        if (authURL !== oauthUrl) {
+          oauthExpiresAt = undefined;
+        }
         oauthUrl = authURL;
+        if (typeof options?.expiresAt === 'number' && Number.isFinite(options.expiresAt)) {
+          oauthExpiresAt = options.expiresAt;
+        }
         oauthRequired = true;
       });
 
@@ -241,16 +268,64 @@ async function reinitMCPServer({
     }
 
     if (connection && !oauthRequired) {
-      tools = await connection.fetchTools();
+      publicationGeneration =
+        mcpManager.getToolPublicationGeneration(connection) ?? publicationGeneration;
+      let snapshot;
+      if (typeof connection.fetchOrderedToolsSnapshot === 'function') {
+        snapshot = await connection.fetchOrderedToolsSnapshot();
+      } else if (typeof connection.fetchToolsSnapshot === 'function') {
+        snapshot = await connection.fetchToolsSnapshot();
+      } else {
+        snapshot = { tools: await connection.fetchTools(), complete: true };
+      }
+      if (snapshot.complete) {
+        tools = snapshot.tools;
+        /** Reserved before this snapshot's tools/list; an app-level catalog cannot publish
+         * without it, and allocating a later one here would outrank fresher tools. */
+        publicationRevision = snapshot.publicationRevision;
+        if (snapshot.orderingUnavailable && typeof connection.refreshToolList === 'function') {
+          /** These tools still serve this request; the connection republishes the shared
+           * catalog under backoff rather than leaving it cold until the next reinitialize. */
+          connection
+            .refreshToolList()
+            .catch((err) =>
+              logger.debug(
+                `[MCP Reinitialize] Could not schedule a catalog republish for ${serverName}: ${err?.message ?? String(err)}`,
+              ),
+            );
+        }
+      } else {
+        logger.warn(
+          `[MCP Reinitialize] Preserving cached tools for ${serverName} because tools/list returned an incomplete snapshot`,
+        );
+      }
     }
 
-    if (tools && tools.length > 0) {
+    if (tools && !ephemeralServer && publicationGeneration) {
+      const currentGeneration = await getMCPToolsCacheGeneration({
+        userId: user.id,
+        serverName,
+      });
+      if (currentGeneration !== publicationGeneration) {
+        logger.warn(
+          `[MCP Reinitialize] Discarding stale tools for ${serverName} because its publication generation changed during discovery`,
+        );
+        tools = null;
+      }
+    }
+
+    if (tools) {
       availableTools = await updateMCPServerTools({
         userId: user.id,
         serverName,
         tools,
         serverConfig,
+        ...(publicationGeneration && { publicationGeneration }),
+        ...(publicationRevision && { publicationRevision }),
       });
+      if (availableTools == null) {
+        tools = null;
+      }
     }
 
     logger.debug(
@@ -270,17 +345,24 @@ async function reinitMCPServer({
       return `Failed to reinitialize MCP server '${serverName}'`;
     };
 
+    const success = Boolean(
+      (connection && !oauthRequired) || (oauthRequired && oauthUrl) || (tools && tools.length > 0),
+    );
+    let failureReason;
+    if (!success) {
+      failureReason = oauthRequired
+        ? MCP_REINITIALIZE_FAILURE_REASONS.OAUTH_REQUIRED
+        : MCP_REINITIALIZE_FAILURE_REASONS.INITIALIZATION_FAILED;
+    }
     const result = {
       availableTools,
-      success: Boolean(
-        (connection && !oauthRequired) ||
-          (oauthRequired && oauthUrl) ||
-          (tools && tools.length > 0),
-      ),
+      success,
       message: getResponseMessage(),
+      failureReason,
       oauthRequired,
       serverName,
       oauthUrl,
+      oauthExpiresAt,
       tools,
     };
 
@@ -300,12 +382,9 @@ async function reinitMCPServer({
   } finally {
     if (connection && ephemeralServer && !requestScopedConnections) {
       try {
-        await connection.disconnect();
+        await connection.dispose();
       } catch (error) {
-        logger.warn(
-          `[MCP Reinitialize] Failed to disconnect ephemeral server ${serverName}`,
-          error,
-        );
+        logger.warn(`[MCP Reinitialize] Failed to dispose ephemeral server ${serverName}`, error);
       }
     }
   }

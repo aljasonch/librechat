@@ -3,6 +3,7 @@ const assistants = require('./assistants');
 const categories = require('./categories');
 const adminAuth = require('./admin/auth');
 const adminConfig = require('./admin/config');
+const adminLangfuse = require('./admin/langfuse');
 const adminGrants = require('./admin/grants');
 const adminGroups = require('./admin/groups');
 const adminRoles = require('./admin/roles');
@@ -36,13 +37,16 @@ const keys = require('./keys');
 const user = require('./user');
 const mcp = require('./mcp');
 const rum = require('./rum');
+const insights = require('./insights');
 
 module.exports = {
+  insights,
   rum,
   mcp,
   auth,
   adminAuth,
   adminConfig,
+  adminLangfuse,
   adminGrants,
   adminGroups,
   adminRoles,

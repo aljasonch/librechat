@@ -4,6 +4,7 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
 const mongoose = require('mongoose');
 
 jest.mock('~/server/services/Config', () => ({
+  syncStaticTools: jest.fn().mockResolvedValue(undefined),
   loadCustomConfig: jest.fn(() => Promise.resolve({})),
   getAppConfig: jest.fn().mockResolvedValue({
     paths: {
@@ -15,6 +16,7 @@ jest.mock('~/server/services/Config', () => ({
     fileStrategy: 'local',
     imageOutputType: 'PNG',
   }),
+  mergeAppTools: jest.fn().mockResolvedValue(undefined),
   setCachedTools: jest.fn(),
 }));
 
@@ -30,6 +32,10 @@ jest.mock('~/config', () => ({
   createMCPManager: jest.fn().mockResolvedValue({
     getAppToolFunctions: jest.fn().mockResolvedValue({}),
   }),
+}));
+
+jest.mock('~/server/services/Agents/triggers', () => ({
+  initializeAgentTriggerService: jest.fn().mockResolvedValue(undefined),
 }));
 
 describe('Server metrics route', () => {
