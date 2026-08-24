@@ -20,7 +20,7 @@ const Markdown = memo(function Markdown({
   isLatestMessage,
   animateWords = false,
 }: TContentProps) {
-  const { isSubmitting = false } = useMessageContext();
+  const { isSubmitting = false } = useMessageContext() ?? {};
   const smoothStreaming = useSmoothStreaming();
   const LaTeXParsing = useRecoilValue<boolean>(store.LaTeXParsing);
   const isInitializing = content === '';

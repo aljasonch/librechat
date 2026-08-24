@@ -10,6 +10,7 @@ import type {
 import type { ReactNode, ReactElement } from 'react';
 import type { ToolCallGroupExpansionState } from './ToolCallGroup';
 import { mapAttachments, filterAttachmentsForPart, groupSequentialToolCalls } from '~/utils';
+import WorkspaceChanges, { partitionWorkspaceChanges } from './Parts/WorkspaceChanges';
 import { groupActivityPhases, lastVisibleContentIdx } from '~/utils/activityLabels';
 import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
 import MemoryArtifacts, { hasMemoryArtifacts } from './MemoryArtifacts';
@@ -248,6 +249,8 @@ type ContentPartsProps = {
     | undefined;
   /** Internal recursion guard for nested phase segments. */
   nestedActivityPhase?: boolean;
+  /** Internal signal that the parent already removed message-level workspace attachments. */
+  workspaceAttachmentsPartitioned?: boolean;
   /** Absolute transcript index represented by `content[0]` in a phase slice. */
   contentIndexOffset?: number;
   /** Absolute transcript index for each compacted sparse segment entry. */
@@ -264,7 +267,7 @@ type ContentPartsProps = {
  * For 90% of messages (single-agent, no parallel execution), this renders sequentially.
  * For multi-agent parallel execution, it uses ParallelContentRenderer to show columns.
  */
-const ContentParts = memo(function ContentParts({
+const ContentPartsBody = memo(function ContentPartsBody({
   edit,
   isLast,
   content,
@@ -283,12 +286,20 @@ const ContentParts = memo(function ContentParts({
   isLatestMessage,
   createdAt,
   nestedActivityPhase = false,
+  workspaceAttachmentsPartitioned = false,
   contentIndexOffset = 0,
   contentIndices,
   resumeAuthors,
   toolGroupExpansionState,
 }: ContentPartsProps) {
-  const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
+  const { inlineAttachments, workspaceChanges } = useMemo(
+    () =>
+      workspaceAttachmentsPartitioned
+        ? { inlineAttachments: attachments ?? [], workspaceChanges: [] }
+        : partitionWorkspaceChanges(attachments),
+    [attachments, workspaceAttachmentsPartitioned],
+  );
+  const attachmentMap = useMemo(() => mapAttachments(inlineAttachments), [inlineAttachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
   const { mutate: updateActivityDuration } = useUpdateMessageActivityDurationMutation();
   const activityDurations = useMemo(() => getActivityDurations(metadata), [metadata]);
@@ -652,7 +663,7 @@ const ContentParts = memo(function ContentParts({
   );
 
   // Early return: no content to render AND no pending skill cards
-  if (!content && !hasPendingSkills) {
+  if (!content && !hasPendingSkills && workspaceChanges.length === 0) {
     return null;
   }
 
@@ -672,6 +683,7 @@ const ContentParts = memo(function ContentParts({
             setSiblingIdx={setSiblingIdx}
             renderReadOnlyPart={(part, idx, isLastPart) => renderPart(part, idx, isLastPart)}
           />
+          <WorkspaceChanges attachments={workspaceChanges} />
         </SearchContext.Provider>
       </ApprovalProvider>
     );
@@ -688,7 +700,7 @@ const ContentParts = memo(function ContentParts({
       key: string,
     ) => {
       return (
-        <ContentParts
+        <ContentPartsBody
           key={key}
           content={segmentContent}
           messageId={messageId}
@@ -696,13 +708,14 @@ const ContentParts = memo(function ContentParts({
           createdAt={createdAt}
           authorHeader={authorHeader}
           conversationId={conversationId}
-          attachments={attachments}
+          attachments={inlineAttachments}
           searchResults={searchResults}
           isCreatedByUser={isCreatedByUser}
           isLast={isLast && segmentIndices.includes(globalLastContentIdx)}
           isSubmitting={isSubmitting}
           isLatestMessage={isLatestMessage}
           nestedActivityPhase
+          workspaceAttachmentsPartitioned
           contentIndexOffset={segmentStartIndex}
           contentIndices={segmentIndices}
           resumeAuthors={postSteerAuthors}
@@ -753,6 +766,7 @@ const ContentParts = memo(function ContentParts({
               )
             ),
           )}
+          <WorkspaceChanges attachments={workspaceChanges} />
         </SearchContext.Provider>
       </ApprovalProvider>
     );
@@ -794,6 +808,7 @@ const ContentParts = memo(function ContentParts({
           contentIndexOffset={contentIndexOffset}
           contentIndices={contentIndices}
         />
+        {!nestedActivityPhase && <WorkspaceChanges attachments={workspaceChanges} />}
       </>
     );
     return nestedActivityPhase ? (
@@ -879,12 +894,17 @@ const ContentParts = memo(function ContentParts({
           );
           return nodes;
         })}
+      {!nestedActivityPhase && <WorkspaceChanges attachments={workspaceChanges} />}
     </SearchContext.Provider>
   );
   if (nestedActivityPhase) {
     return sequentialContent;
   }
   return <ApprovalProvider>{sequentialContent}</ApprovalProvider>;
+});
+
+const ContentParts = memo(function ContentParts(props: ContentPartsProps) {
+  return <ContentPartsBody {...props} />;
 });
 
 export default ContentParts;

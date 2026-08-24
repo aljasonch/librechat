@@ -23,13 +23,13 @@ import { unicodeCitation } from '~/components/Web';
  * whole-message renderer and the per-block memoized renderer so both produce
  * identical output.
  *
- * These are exposed as lazily-initialized, cached getters rather than top-level
- * consts on purpose: `MarkdownComponents` participates in a circular import
- * (`MarkdownComponents` → `CodeBlock` → `Parts` → `Markdown` → here →
- * `MarkdownComponents`). Reading `code`/`a`/… at module-evaluation time throws
- * `Cannot access 'code' before initialization` under native ESM. Deferring the
- * read to first call (render time) sidesteps the temporal dead zone, and caching
- * keeps a stable reference so react-markdown does not rebuild its processor.
+ * These are exposed as lazily-initialized getters rather than top-level
+ * consts on purpose: MarkdownComponents participates in a circular import
+ * (MarkdownComponents -> CodeBlock -> Parts -> Markdown -> here ->
+ * MarkdownComponents). Reading code/a/... at module-evaluation time throws
+ * Cannot access 'code' before initialization under native ESM. Deferring the
+ * read to call time (when components render or memoize) sidesteps the
+ * temporal dead zone.
  */
 let remarkPluginsCache: PluggableList | null = null;
 let rehypePluginsCache: PluggableList | null = null;
