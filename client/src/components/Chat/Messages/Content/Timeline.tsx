@@ -1227,7 +1227,7 @@ function Timeline({
           } as CSSProperties
         }
         className={cn(
-          'activity-panel-sheet fixed inset-x-0 bottom-0 z-[80] flex max-h-[82dvh] flex-col rounded-t-2xl border border-border-light bg-white text-text-primary shadow-[0_-12px_48px_rgba(0,0,0,0.18)] dark:bg-gray-800 lg:inset-y-0 lg:left-auto lg:right-0 lg:max-h-none lg:w-[384px] lg:rounded-none lg:border-y-0 lg:border-r-0 lg:shadow-xl',
+          'activity-panel-sheet fixed inset-x-0 bottom-0 z-[80] flex max-h-[82dvh] flex-col rounded-t-2xl border border-border-light bg-white text-text-primary dark:bg-gray-800 lg:inset-y-0 lg:left-auto lg:right-0 lg:max-h-none lg:w-[384px] lg:rounded-none lg:border-y-0 lg:border-r-0',
           isPanelClosing ? 'activity-panel-sheet-closing' : 'activity-panel-sheet-open',
           isDraggingPanel && 'activity-panel-sheet-dragging',
         )}
