@@ -5,6 +5,7 @@
   "scripts": {
     "start": "echo 'please run this from the root directory'",
     "server-dev": "echo 'please run this from the root directory'",
+    "backend": "NODE_ENV=production node server/index.js",
     "test": "cross-env NODE_ENV=test jest",
     "b:test": "NODE_ENV=test bun jest",
     "test:ci": "jest --ci --logHeapUsage",
