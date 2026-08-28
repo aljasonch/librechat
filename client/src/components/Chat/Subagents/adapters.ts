@@ -3,6 +3,8 @@ import type {
   Agents,
   PartMetadata,
   SubagentActivityItem,
+  SubagentControlReceipt,
+  SubagentThreadTurn,
   SubagentThreadStatus,
   SubagentThreadView,
   TMessageContentParts,
@@ -44,6 +46,7 @@ export type ChildActivityItem =
       agentIds?: string[];
       status?: 'ok' | 'partial' | 'failed';
       pending?: boolean;
+      labelTruncated?: boolean;
     };
 
 export type ChildActivity = {
@@ -51,7 +54,19 @@ export type ChildActivity = {
   prompt?: string;
   status: SubagentThreadStatus;
   items: ChildActivityItem[];
+  controls?: Array<
+    Omit<SubagentControlReceipt, 'status'> & {
+      status: SubagentControlReceipt['status'] | 'submitted';
+    }
+  >;
   activityTruncated?: boolean;
+  controlsTruncated?: boolean;
+};
+
+export type ChildConversationTurn = {
+  taskId: string;
+  trigger: SubagentThreadTurn['trigger'];
+  activity: ChildActivity;
 };
 
 type ContentToolCall = {
@@ -157,6 +172,7 @@ const publicActivityToChildActivity = (items: SubagentActivityItem[]): ChildActi
     return {
       ...item,
       ...(item.input == null ? {} : { input: item.input }),
+      ...(item.inputValidationError === true ? { inputValidationError: true } : {}),
     };
   });
 
@@ -283,6 +299,7 @@ export function adaptLivePersistedActivity(input: {
     ...(input.prompt == null ? {} : { prompt: input.prompt }),
     status: liveStatus(input),
     items,
+    controls: [],
   };
 }
 
@@ -313,13 +330,100 @@ export function adaptDurableThreadActivity(
     ...(prompt == null ? {} : { prompt }),
     status,
     items,
-    activityTruncated:
-      view.activityTruncated ||
-      view.historyTruncated ||
-      (view.activity ?? []).some(
-        (item) =>
-          (item.type === 'writing' && item.textTruncated === true) ||
-          (item.type === 'tool' && (item.inputTruncated === true || item.outputTruncated === true)),
-      ),
+    controls: view.controlReceipts ?? [],
+    controlsTruncated: view.controlReceiptsTruncated === true,
+    activityTruncated: view.activityTruncated,
   };
+}
+
+const adaptDurableTurn = (turn: SubagentThreadTurn, title: string): ChildConversationTurn => {
+  const items = publicActivityToChildActivity(turn.activity ?? []);
+  const response = turn.messages.find((message) => message.role === 'assistant');
+  if (items.length === 0 && response?.text != null && response.text !== '') {
+    items.push({
+      type: 'writing',
+      text: response.text,
+      ...(response.textTruncated === true ? { textTruncated: true } : {}),
+    });
+  }
+  return {
+    taskId: turn.taskId,
+    trigger: turn.trigger,
+    activity: {
+      title,
+      status: turn.status,
+      items,
+      controls: turn.controlReceipts ?? [],
+      controlsTruncated: turn.controlReceiptsTruncated === true,
+      activityTruncated: turn.activityTruncated,
+    },
+  };
+};
+
+/** Adapts the branch-selected durable history into one chronological child conversation. */
+export function adaptDurableThreadConversation(view: SubagentThreadView): ChildConversationTurn[] {
+  return (view.turns ?? []).map((turn) => adaptDurableTurn(turn, view.title));
+}
+
+const triggerDetailScore = (turn: ChildConversationTurn): number =>
+  (turn.trigger.summary.trim().length > 0 ? 1 : 0) +
+  (turn.trigger.createdAt == null ? 0 : 1) +
+  (turn.trigger.externalEvent == null ? 0 : 2);
+
+const mergeTurnControls = (
+  older: ChildActivity['controls'],
+  newer: ChildActivity['controls'],
+): ChildActivity['controls'] => {
+  if (older == null) return newer;
+  if (newer == null) return older;
+  const receipts = new Map(older.map((receipt) => [receipt.invocationId, receipt]));
+  for (const receipt of newer) receipts.set(receipt.invocationId, receipt);
+  return [...receipts.values()];
+};
+
+/** Merge chronological page projections whose bounded Mongo windows can split
+ * one task between its user trigger and assistant activity records. */
+export function mergeChildConversationTurns(
+  ...pages: ChildConversationTurn[][]
+): ChildConversationTurn[] {
+  const merged: ChildConversationTurn[] = [];
+  const indexByTaskId = new Map<string, number>();
+  for (const turn of pages.flat()) {
+    const existingIndex = indexByTaskId.get(turn.taskId);
+    if (existingIndex == null) {
+      indexByTaskId.set(turn.taskId, merged.length);
+      merged.push(turn);
+      continue;
+    }
+    const older = merged[existingIndex];
+    const trigger =
+      triggerDetailScore(turn) > triggerDetailScore(older) ? turn.trigger : older.trigger;
+    const controls = mergeTurnControls(older.activity.controls, turn.activity.controls);
+    merged[existingIndex] = {
+      taskId: turn.taskId,
+      trigger,
+      activity: {
+        ...older.activity,
+        ...turn.activity,
+        items: turn.activity.items.length > 0 ? turn.activity.items : older.activity.items,
+        ...(controls == null ? {} : { controls }),
+        activityTruncated:
+          older.activity.activityTruncated === true || turn.activity.activityTruncated === true,
+        controlsTruncated:
+          older.activity.controlsTruncated === true || turn.activity.controlsTruncated === true,
+      },
+    };
+  }
+  return merged;
+}
+
+/** Polling may displace turns from the API's latest window. Retain only one
+ * bounded bridge window; older pages remain an explicit user action. */
+export const MAX_RETAINED_MOVING_WINDOW_TURNS = 50;
+
+export function retainBoundedMovingWindowTurns(
+  current: ChildConversationTurn[],
+  displaced: ChildConversationTurn[],
+): ChildConversationTurn[] {
+  return mergeChildConversationTurns(current, displaced).slice(-MAX_RETAINED_MOVING_WINDOW_TURNS);
 }

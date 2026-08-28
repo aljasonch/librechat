@@ -1024,8 +1024,17 @@ export function getSubagentThread(
   parentConversationId: string,
   threadId: string,
   taskId?: string,
+  cursor?: string,
 ): Promise<t.SubagentThreadView> {
-  return request.get(endpoints.subagentThread(parentConversationId, threadId, taskId));
+  return request.get(endpoints.subagentThread(parentConversationId, threadId, taskId, cursor));
+}
+
+export function controlSubagentTask(
+  parentConversationId: string,
+  threadId: string,
+  body: t.SubagentControlRequest,
+): Promise<t.SubagentControlResponse> {
+  return request.post(endpoints.subagentControl(parentConversationId, threadId), body);
 }
 
 export function getPrompt(id: string): Promise<{ prompt: t.TPrompt }> {

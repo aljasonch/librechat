@@ -1,3 +1,4 @@
+import 'katex/contrib/mhchem';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import supersub from 'remark-supersub';
@@ -12,10 +13,10 @@ import {
   MCPUIResourceCarousel,
 } from '~/components/MCPUIResource';
 import { Citation, CompositeCitation, HighlightedText } from '~/components/Web/Citation';
+import { langSubset, remarkApproxTilde, remarkSingleDollarMath } from '~/utils';
 import { Artifact, artifactPlugin } from '~/components/Artifacts/Artifact';
-import { code, a, p, img, table } from './MarkdownComponents';
 import { rehypeStreamingWords, StreamingSpan } from './streaming';
-import { langSubset, remarkApproxTilde } from '~/utils';
+import { code, a, p, img, table } from './MarkdownComponents';
 import { unicodeCitation } from '~/components/Web';
 
 /**
@@ -31,14 +32,37 @@ import { unicodeCitation } from '~/components/Web';
  * read to call time (when components render or memoize) sidesteps the
  * temporal dead zone.
  */
+
 let remarkPluginsCache: PluggableList | null = null;
+let remarkNoSingleDollarCache: PluggableList | null = null;
 let rehypePluginsCache: PluggableList | null = null;
 let streamingRehypePluginsCache: PluggableList | null = null;
 let markdownComponentsCache: { [nodeType: string]: ElementType } | null = null;
 
-export const getRemarkPlugins = (): PluggableList => {
-  if (remarkPluginsCache === null) {
-    remarkPluginsCache = [
+/**
+ * `latexParsing` (the user setting) gates only the ambiguous single-dollar syntax; the
+ * unambiguous `$$`, `\(...\)`, and `\[...\]` delimiters always parse via `remark-math`
+ * (aliased to `micromark-extension-llm-math` in vite and jest config).
+ */
+export const getRemarkPlugins = (latexParsing = true): PluggableList => {
+  if (latexParsing) {
+    if (remarkPluginsCache === null) {
+      remarkPluginsCache = [
+        remarkApproxTilde,
+        supersub,
+        remarkGfm,
+        remarkDirective,
+        artifactPlugin,
+        [remarkMath, { singleDollarTextMath: false }],
+        remarkSingleDollarMath,
+        unicodeCitation,
+        mcpUIResourcePlugin,
+      ];
+    }
+    return remarkPluginsCache;
+  }
+  if (remarkNoSingleDollarCache === null) {
+    remarkNoSingleDollarCache = [
       remarkApproxTilde,
       supersub,
       remarkGfm,
@@ -49,7 +73,7 @@ export const getRemarkPlugins = (): PluggableList => {
       mcpUIResourcePlugin,
     ];
   }
-  return remarkPluginsCache;
+  return remarkNoSingleDollarCache;
 };
 
 const getBaseRehypePlugins = (): PluggableList => {

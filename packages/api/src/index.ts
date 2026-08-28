@@ -43,6 +43,8 @@ export * from './crypto';
 export * from './flow/manager';
 /* Middleware */
 export * from './middleware';
+/* Security */
+export * from './security';
 /* Content protection */
 export * from './protection';
 /* Imports */
@@ -76,6 +78,8 @@ export * from './plugins';
 export * from './endpoints';
 /* Files */
 export * from './files';
+/* Images */
+export * from './images';
 /* Storage */
 export * from './storage';
 /* Tools */
