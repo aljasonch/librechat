@@ -221,3 +221,10 @@ Without it, OpenID JWT request burst caching can serve a stale `req.user` until 
 ## Formatting
 
 Fix all formatting lint errors (trailing spaces, tabs, newlines, indentation) using auto-fix when available. All TypeScript/ESLint warnings and errors **must** be resolved.
+
+## Fork custom changes
+
+This fork carries custom features on top of upstream (timeline UI, word fade, duration
+persistence, Docker/CI tweaks). Before resolving merge conflicts or changing the
+message-rendering pipeline, read `FORK.md` — it lists every fork-only file and the
+conflict-resolution rules.

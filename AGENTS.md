@@ -1,5 +1,12 @@
 See CLAUDE.md.
 
+## Fork custom changes
+
+This fork carries custom features on top of upstream (timeline UI, word fade, duration
+persistence, Docker/CI tweaks). Before resolving merge conflicts or changing the
+message-rendering pipeline, read `FORK.md` — it lists every fork-only file and the
+conflict-resolution rules.
+
 ## Frontend theming and styling
 
 For frontend work, compose existing `@librechat/client` primitives and variants before adding
