@@ -5,6 +5,7 @@ import { useToastContext } from '@librechat/client';
 import { useQueryClient } from '@tanstack/react-query';
 import { useRecoilValue, useSetRecoilState } from 'recoil';
 import {
+  megabyte,
   QueryKeys,
   Constants,
   EToolResources,
@@ -13,19 +14,28 @@ import {
   getEndpointFileConfig,
   defaultAssistantsVersion,
 } from 'librechat-data-provider';
-import type { EModelEndpoint, TEndpointsConfig, TError } from 'librechat-data-provider';
+import type {
+  TError,
+  EModelEndpoint,
+  TEndpointsConfig,
+  EndpointFileConfig,
+} from 'librechat-data-provider';
 import type { TConversation } from 'librechat-data-provider';
+import type { SkippedUpload, UploadPartition } from '~/utils';
 import type { ExtendedFile, FileSetter } from '~/common';
 import {
   logger,
   validateFiles,
   cachePreview,
+  partitionUploads,
   validateFileSizes,
+  validateFileLimit,
   getCachedPreview,
   removePreviewEntry,
   validateFileDuplicates,
 } from '~/utils';
 import { useGetFileConfig, useUploadFileMutation } from '~/data-provider';
+import useAgentUploadTarget from '~/hooks/Agents/useAgentUploadTarget';
 import useLocalize, { TranslationKeys } from '~/hooks/useLocalize';
 import { useDelayedUploadToast } from './useDelayedUploadToast';
 import { useChatContext } from '~/Providers/ChatContext';
@@ -158,6 +168,37 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
   );
   const isTemporary = useRecoilValue(store.isTemporary);
   const setError = (error: string) => setErrors((prevErrors) => [...prevErrors, error]);
+
+  /** Names the files left out of a batch that is otherwise still uploading. Callers report a batch
+   * rejected in full through the existing all-or-nothing errors instead. */
+  const reportSkippedUploads = (
+    skipped: SkippedUpload[],
+    endpointFileConfig: EndpointFileConfig,
+  ) => {
+    if (skipped.length === 0) {
+      return;
+    }
+    const duplicates: string[] = [];
+    const oversized: string[] = [];
+    for (const { file, reason } of skipped) {
+      if (reason === 'duplicate') {
+        duplicates.push(file.name);
+        continue;
+      }
+      oversized.push(file.name);
+    }
+    if (duplicates.length > 0) {
+      setError(localize('com_error_files_skipped_dupe', { 0: duplicates.join(', ') }));
+    }
+    if (oversized.length > 0) {
+      setError(
+        localize('com_error_files_skipped_size', {
+          0: `${(endpointFileConfig.fileSizeLimit ?? 0) / megabyte}`,
+          1: oversized.join(', '),
+        }),
+      );
+    }
+  };
   const { addFile, replaceFile, updateFileById, deleteFileById } = useUpdateFiles(fileSetter);
   const { isConfigPending, waitForConfig, resizeImageIfNeeded } = useClientResize();
 
@@ -174,6 +215,12 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
     () => endpointOverride ?? conversation?.endpoint ?? 'default',
     [endpointOverride, conversation?.endpoint],
   );
+  const uploadTarget = useAgentUploadTarget(conversation);
+  /** An agent's file policy lives under its provider, which is the entry the server
+   *  validates against. An explicit override names its own endpoint and keeps it. */
+  const agentProvider = endpointOverride != null ? undefined : uploadTarget.agentProvider;
+  const agentEndpointType = endpointOverride != null ? undefined : uploadTarget.endpointType;
+  const usesResponsesApi = uploadTarget.useResponsesApi;
 
   const { data: fileConfig = null } = useGetFileConfig({
     select: (data) => mergeFileConfig(data),
@@ -227,7 +274,6 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
         const fileId = (body.get('file_id') as string | null) ?? data.temp_file_id;
         takeUploadRecovery(fileId)?.onSuccess?.(fileId);
         clearUploadTimer(fileId);
-        console.log('upload success', data);
         if (agent_id) {
           queryClient.refetchQueries([QueryKeys.agent, agent_id]);
           return;
@@ -321,6 +367,13 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
     const formData = new FormData();
     formData.append('endpoint', endpoint);
     formData.append('endpointType', endpointType ?? '');
+    /* Azure carries native documents only through the Responses API, so routing needs to
+     * know which one this conversation uses. A saved agent holds the setting on its own
+     * record when the conversation does not carry one, which is the same fallback the
+     * attach menu and the drop handler resolve. */
+    if (usesResponsesApi === true) {
+      formData.append('useResponsesApi', 'true');
+    }
     formData.append('file', extendedFile.file as File, encodeURIComponent(filename));
     formData.append('file_id', extendedFile.file_id);
     if (
@@ -450,9 +503,9 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       : filesRef.current;
     const currentFileConfig = fileConfigRef.current;
     const endpointFileConfig = getEndpointFileConfig({
-      endpoint,
+      endpoint: agentProvider ?? endpoint,
       fileConfig: currentFileConfig,
-      endpointType,
+      endpointType: agentProvider != null ? agentEndpointType : endpointType,
     });
     /** The source remains visible until success, so exclude only its matching entry from this
      * upload's validation tallies. All other callers validate against the complete file map. */
@@ -475,17 +528,35 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       return withoutSource;
     })();
 
+    /** Drop duplicates one by one rather than rejecting everything picked alongside them, and hand
+     * the survivors to `validateFiles`. Sizes wait for the partition below, once processing has
+     * settled each file's final bytes, which is also where the file count is finally applied: a
+     * file still headed for the discard pile must not spend a `fileLimit` slot. */
+    const selection = partitionUploads({
+      files: filesForValidation,
+      fileList,
+      endpointFileConfig,
+      skipSizeValidation: true,
+    });
+    /** Nothing survived, so the whole selection is rejected and the untouched list reports it
+     * through the usual checks in their usual order. */
+    const acceptedFileList =
+      selection.keptIndices.length > 0
+        ? selection.keptIndices.map((index) => fileList[index])
+        : fileList;
+
     /* Validate files */
     let filesAreValid: boolean;
     try {
       filesAreValid = validateFiles({
         files: filesForValidation,
-        fileList,
+        fileList: acceptedFileList,
         setError,
         fileConfig: currentFileConfig,
         endpointFileConfig,
         toolResource: _toolResource,
         skipSizeValidation: true,
+        skipBatchRules: selection.keptIndices.length > 0,
       });
     } catch (error) {
       console.error('file validation error', error);
@@ -500,7 +571,7 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
 
     /* Process files */
     const processedUploads: ProcessedUpload[] = [];
-    for (const [fileIndex, originalFile] of fileList.entries()) {
+    for (const [fileIndex, originalFile] of acceptedFileList.entries()) {
       const file_id =
         fileIndex === 0 && uploadLifecycle?.fileId != null && uploadLifecycle.fileId !== ''
           ? uploadLifecycle.fileId
@@ -619,31 +690,69 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       }
     }
 
+    const discardProcessedUpload = ({ extendedFile, preview }: ProcessedUpload) => {
+      deleteFileById(extendedFile.file_id);
+      removePreviewEntry(extendedFile.file_id);
+      URL.revokeObjectURL(preview);
+    };
+
     const discardProcessedUploads = () => {
-      for (const { extendedFile, preview } of processedUploads) {
-        deleteFileById(extendedFile.file_id);
-        removePreviewEntry(extendedFile.file_id);
-        URL.revokeObjectURL(preview);
+      for (const upload of processedUploads) {
+        discardProcessedUpload(upload);
       }
       filesRef.current = existingFiles;
     };
 
     const processedFileList = processedUploads.map(({ extendedFile }) => extendedFile.file as File);
 
-    let batchIsValid: boolean;
+    let batch: UploadPartition;
+    let acceptedUploads: ProcessedUpload[];
     try {
-      batchIsValid =
-        validateFileDuplicates({
+      batch = partitionUploads({
+        files: filesForValidation,
+        fileList: processedFileList,
+        endpointFileConfig,
+      });
+      acceptedUploads = batch.keptIndices.map((index) => processedUploads[index]);
+      const acceptedFiles = acceptedUploads.map(({ extendedFile }) => extendedFile.file as File);
+      /** `fileLimit` and `totalSizeLimit` describe the batch rather than any one file, so both are
+       * applied to whatever survived the per-file partition above. */
+      const batchIsValid =
+        acceptedUploads.length > 0 &&
+        validateFileLimit({
           files: filesForValidation,
-          fileList: processedFileList,
+          fileList: acceptedFiles,
           setError,
+          endpointFileConfig,
         }) &&
         validateFileSizes({
           files: filesForValidation,
-          fileList: processedFileList,
+          fileList: acceptedFiles,
           setError,
           endpointFileConfig,
         });
+      if (!batchIsValid) {
+        /** Nothing is left to upload, so this is the pre-existing all-or-nothing rejection and it
+         * keeps reporting itself that way instead of as per-file skip notices. */
+        if (acceptedUploads.length === 0) {
+          const noDuplicates = validateFileDuplicates({
+            files: filesForValidation,
+            fileList: processedFileList,
+            setError,
+          });
+          if (noDuplicates) {
+            validateFileSizes({
+              files: filesForValidation,
+              fileList: processedFileList,
+              setError,
+              endpointFileConfig,
+            });
+          }
+        }
+        discardProcessedUploads();
+        setFilesLoading(false);
+        return false;
+      }
     } catch (error) {
       console.error('file validation error', error);
       setError('com_error_files_validation');
@@ -651,14 +760,16 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       setFilesLoading(false);
       return false;
     }
-    if (!batchIsValid) {
-      discardProcessedUploads();
-      setFilesLoading(false);
-      return false;
+
+    for (const { index } of batch.skipped) {
+      discardProcessedUpload(processedUploads[index]);
     }
+    /** Held until the batch is known to be uploading: a selection that is rejected in full reports
+     * itself through the batch-level errors alone, never alongside a partial-success notice. */
+    reportSkippedUploads([...selection.skipped, ...batch.skipped], endpointFileConfig);
 
     const filesWithProcessedUploads = new Map(existingFiles);
-    for (const { extendedFile } of processedUploads) {
+    for (const { extendedFile } of acceptedUploads) {
       filesWithProcessedUploads.set(extendedFile.file_id, extendedFile);
       if (tracksReservations) {
         uploadScope.recent.set(extendedFile.file_id, extendedFile);
@@ -666,7 +777,7 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
     }
     filesRef.current = filesWithProcessedUploads;
 
-    for (const { extendedFile, preview, resizeDetails } of processedUploads) {
+    for (const { extendedFile, preview, resizeDetails } of acceptedUploads) {
       if (resizeDetails) {
         const { originalSize, newSize, compressionRatio } = resizeDetails;
         showToast({
@@ -688,7 +799,7 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       await startUpload(extendedFile, uploadLifecycle);
     }
 
-    return processedUploads.length > 0;
+    return acceptedUploads.length > 0;
   };
 
   const handleFiles = async (

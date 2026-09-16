@@ -1,8 +1,9 @@
+import { z } from 'zod';
 import type { OpenAPIV3 } from 'openapi-types';
-import type { AssistantsEndpoint, AgentProvider, MemoryScope } from 'src/schemas';
+import type { AssistantsEndpoint, AgentProvider, MemoryScope, SkillsScope } from 'src/schemas';
 import type { StatefulCodeEnvironment } from '../stateful-code';
+import type { ContentTypes, SubagentIdentity } from './runs';
 import type { Agents, GraphEdge } from './agents';
-import type { ContentTypes } from './runs';
 import type { TFile } from './files';
 import { ArtifactModes } from 'src/artifacts';
 export {
@@ -301,11 +302,37 @@ export type AgentSubagentsConfig = {
   enabled?: boolean;
   /** When true (default), the agent may spawn itself in an isolated context. */
   allowSelf?: boolean;
+  /** Share current-turn files with authorized descendants. Off unless explicitly enabled. */
+  shareFiles?: boolean;
   /** Specific agents that may be spawned as subagents. */
   agent_ids?: string[];
   /** Explicit saved-agent teams that may be spawned as bounded child graphs. */
   graphs?: AgentSubagentGraph[];
 };
+
+export type AgentGitIdentity = {
+  /** Commit author and committer display name. */
+  name: string;
+  /** Commit author and committer email address. */
+  email: string;
+};
+
+export const agentGitIdentitySchema: z.ZodType<AgentGitIdentity | undefined> = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(1)
+      .max(128)
+      .refine((value) => !/[\0\r\n]/.test(value)),
+    email: z
+      .string()
+      .trim()
+      .email()
+      .max(254)
+      .refine((value) => !/[\0\r\n]/.test(value)),
+  })
+  .optional();
 
 export type Agent = {
   _id?: string;
@@ -337,6 +364,12 @@ export type Agent = {
   stateful_code_sessions?: boolean;
   /** Stateful workspace sharing scope. Defaults to one workspace per user. */
   stateful_code_environment?: StatefulCodeEnvironment;
+  /** Operator-configured managed or attached stateful execution environment. */
+  code_environment_id?: string | null;
+  /** Default attached workspace for new chats; empty means no agent default. */
+  code_workspace_id?: string;
+  /** Non-secret Git authorship injected into this agent's sandboxed commands. */
+  git_identity?: AgentGitIdentity | null;
   artifacts?: ArtifactModes;
   recursion_limit?: number;
   isPublic?: boolean;
@@ -366,6 +399,10 @@ export type Agent = {
   /** Master toggle for skill use on this agent. `true` = active (full catalog unless
    *  `skills` narrows it). `false`/undefined = inactive (no skills available). */
   skills_enabled?: boolean;
+  /** Enables runtime skill creation without exposing an existing skill catalog. */
+  skill_authoring_enabled?: boolean;
+  /** Explicit catalog exposure while skills are enabled. Missing preserves legacy semantics. */
+  skills_scope?: SkillsScope;
   /** Subagent spawning configuration — isolated-context child agents. */
   subagents?: AgentSubagentsConfig;
   /** Memory partition: `agent` isolates memories per (user, agent); default shared pool */
@@ -375,6 +412,7 @@ export type Agent = {
 export type TAgentsMap = Record<string, Agent | undefined>;
 
 export type AgentCreateParams = {
+  git_identity?: AgentGitIdentity;
   name?: string | null;
   description?: string | null;
   avatar?: AgentAvatar | null;
@@ -392,6 +430,8 @@ export type AgentCreateParams = {
   | 'hide_sequential_outputs'
   | 'stateful_code_sessions'
   | 'stateful_code_environment'
+  | 'code_environment_id'
+  | 'code_workspace_id'
   | 'artifacts'
   | 'recursion_limit'
   | 'category'
@@ -399,6 +439,8 @@ export type AgentCreateParams = {
   | 'tool_options'
   | 'skills'
   | 'skills_enabled'
+  | 'skill_authoring_enabled'
+  | 'skills_scope'
   | 'subagents'
   | 'memory_scope'
 >;
@@ -422,6 +464,9 @@ export type AgentUpdateParams = {
   | 'hide_sequential_outputs'
   | 'stateful_code_sessions'
   | 'stateful_code_environment'
+  | 'code_environment_id'
+  | 'git_identity'
+  | 'code_workspace_id'
   | 'artifacts'
   | 'recursion_limit'
   | 'category'
@@ -429,6 +474,8 @@ export type AgentUpdateParams = {
   | 'tool_options'
   | 'skills'
   | 'skills_enabled'
+  | 'skill_authoring_enabled'
+  | 'skills_scope'
   | 'subagents'
   | 'memory_scope'
 >;
@@ -601,6 +648,8 @@ export enum RunStatus {
 }
 
 export type PartMetadata = {
+  /** Host-resolved execution identity for a saved subagent invocation. */
+  subagentIdentity?: SubagentIdentity;
   progress?: number;
   asset_pointer?: string;
   status?: string;
@@ -673,6 +722,13 @@ export type SummaryContentPart = {
   content?: Array<{ type: ContentTypes.TEXT; text: string }>;
   tokenCount?: number;
   summarizing?: boolean;
+  /** A summarize round that ended in error. Partial deltas already streamed
+   *  into this slot are kept, so the renderer needs this to avoid presenting
+   *  truncated text under the "Conversation summarized" label. */
+  failed?: boolean;
+  /** Set when the user compacted the context manually rather than the
+   *  automatic detour firing on context pressure. */
+  initiatedBy?: 'user';
   summaryVersion?: number;
   model?: string;
   provider?: string;
@@ -710,6 +766,10 @@ export type TMessageContentParts =
       type: ContentTypes.ERROR;
       text?: string | TextData;
       error?: string;
+      /** Set when this failure is what a manual compaction produced instead of a
+       *  summary. The turn has no other record of having been one, so the rerun
+       *  controls read it the same way they read a summary's marker. */
+      initiatedBy?: 'user';
     } & ContentMetadata)
   | ({
       type: ContentTypes.THINK;
@@ -726,6 +786,9 @@ export type TMessageContentParts =
       reasoning_label_revision?: number;
       /** Whether the reasoning step can still produce a newer label. */
       reasoning_label_status?: 'streaming' | 'complete';
+      /** The reasoning happened but its text is not available to this view
+       *  (e.g. detached subagent projections retain only a marker). */
+      reasoning_unavailable?: boolean;
     } & ContentMetadata)
   | (SteerContentPart & ContentMetadata)
   | ({

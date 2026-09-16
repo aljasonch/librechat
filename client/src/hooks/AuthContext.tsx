@@ -8,10 +8,12 @@ import {
   createContext,
 } from 'react';
 import { debounce } from 'lodash';
+import { getDefaultStore } from 'jotai';
 import { useNavigate } from 'react-router-dom';
 import { useRecoilState, useSetRecoilState } from 'recoil';
 import {
   apiBaseUrl,
+  ErrorTypes,
   SystemRoles,
   setTokenHeader,
   isSystemRoleName,
@@ -34,6 +36,7 @@ import {
   useLogoutUserMutation,
   useRefreshTokenMutation,
 } from '~/data-provider';
+import { resetChatFilterSessionAtom } from '~/components/Conversations/chatFilters';
 import { TAuthConfig, TUserContext, TAuthContext, TResError } from '~/common';
 import useTimeout from './useTimeout';
 import store from '~/store';
@@ -51,6 +54,7 @@ if (import.meta.hot) {
  * that reliably sees the transition. Both are cleared together so neither can be added to an exit
  * path the other was wired into. */
 const endSessionClientState = (): void => {
+  getDefaultStore().set(resetChatFilterSessionAtom);
   clearRetainedFileDeletions();
   clearComposerDraftStorage();
 };
@@ -68,6 +72,7 @@ const AuthContextProvider = ({
   const [token, setToken] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(authConfig?.test === true);
   const setQueriesEnabled = useSetRecoilState<boolean>(store.queriesEnabled);
 
   const userRoleName = user?.role ?? '';
@@ -93,6 +98,7 @@ const AuthContextProvider = ({
         setToken(token);
         setTokenHeader(token);
         setIsAuthenticated(isAuthenticated);
+        setIsAuthReady(true);
         if (isAuthenticated) {
           setQueriesEnabled(true);
           /** The clear on the way out latches retention shut so a DELETE that settles afterwards
@@ -141,7 +147,8 @@ const AuthContextProvider = ({
     },
     onError: (error: TResError | unknown) => {
       const resError = error as TResError;
-      doSetError(resError.message);
+      const code = resError.response?.data?.code;
+      doSetError(code === ErrorTypes.AUTH_CROSS_ORIGIN ? code : resError.message);
       // Preserve a valid redirect_to across login failures so the deep link survives retries.
       // Cannot use buildLoginRedirectUrl() here — it reads the current pathname (already /login)
       // and would return plain /login, dropping the redirect_to destination.
@@ -205,7 +212,6 @@ const AuthContextProvider = ({
 
   const silentRefresh = useCallback(() => {
     if (authConfig?.test === true) {
-      console.log('Test mode. Skipping silent refresh.');
       return;
     }
     if (isExternalRedirectRef.current) {
@@ -235,10 +241,13 @@ const AuthContextProvider = ({
         }
         console.log('Token is not present. User is not authenticated.');
         endSessionClientState();
+        setIsAuthReady(true);
         if (authConfig?.test === true) {
           return;
         }
-        navigate(buildLoginRedirectUrl());
+        if (authConfig?.optional !== true) {
+          navigate(buildLoginRedirectUrl());
+        }
       },
       onError: (error) => {
         if (isExternalRedirectRef.current) {
@@ -246,10 +255,13 @@ const AuthContextProvider = ({
         }
         console.log('refreshToken mutation error:', error);
         endSessionClientState();
+        setIsAuthReady(true);
         if (authConfig?.test === true) {
           return;
         }
-        navigate(buildLoginRedirectUrl());
+        if (authConfig?.optional !== true) {
+          navigate(buildLoginRedirectUrl());
+        }
       },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are stable at mount; adding refreshToken causes infinite re-fire
@@ -264,7 +276,10 @@ const AuthContextProvider = ({
     } else if (userQuery.isError) {
       endSessionClientState();
       doSetError((userQuery.error as Error).message);
-      navigate(buildLoginRedirectUrl(), { replace: true });
+      setIsAuthReady(true);
+      if (authConfig?.optional !== true) {
+        navigate(buildLoginRedirectUrl(), { replace: true });
+      }
     }
     if (error != null && error && isAuthenticated) {
       doSetError(undefined);
@@ -319,6 +334,7 @@ const AuthContextProvider = ({
         ...(isCustomRole && customRole ? { [userRoleName]: customRole } : {}),
       },
       isAuthenticated,
+      isAuthReady,
     }),
 
     /** `login` is a plain function rebuilt every render, so depending on it would rebuild this
@@ -328,6 +344,7 @@ const AuthContextProvider = ({
       user,
       error,
       isAuthenticated,
+      isAuthReady,
       token,
       userRole,
       adminRole,

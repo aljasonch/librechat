@@ -1,11 +1,20 @@
+import { Buffer } from 'node:buffer';
 import { RetentionMode } from 'librechat-data-provider';
-import type { AnyBulkWriteOperation, FilterQuery, Model, SortOrder, Types } from 'mongoose';
-import type { DeleteResult } from 'mongoose';
+import type {
+  AnyBulkWriteOperation,
+  DeleteResult,
+  FilterQuery,
+  Model,
+  SortOrder,
+  Types,
+} from 'mongoose';
+import type { SearchParams } from 'meilisearch';
 import type {
   IAgentEventActorCheckpoint,
   IAgentEventActorReconciliation,
   IAgentEventActorSnapshot,
   IAgentEventActorState,
+  IAgentEventActorSuspensionEvidence,
   IAgentEventBindingRecord,
   IAgentTriggerDeliveryDocument,
   AppConfig,
@@ -15,7 +24,15 @@ import type {
   ISharedLink,
   ISubagentThreadReservation,
 } from '~/types';
+import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type { MessageMethods } from './message';
+import {
+  MAX_AGENT_EVENT_ACTOR_DISCOVERED_TOOLS,
+  MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH,
+  MAX_AGENT_EVENT_ACTOR_SKILLS,
+  MAX_AGENT_EVENT_ACTOR_SUMMARY_LENGTH,
+  MAX_AGENT_EVENT_ACTOR_TOOL_NAME_LENGTH,
+} from '~/types/convo';
 import {
   activeExpirationFilter,
   buildRetentionVisibilityFilter,
@@ -25,13 +42,86 @@ import {
   refreshChatProjectStatsForUser,
   updateChatProjectLastConversationForUser,
 } from './chatProject';
-import { createTempChatExpirationDate } from '~/utils/tempChatRetention';
+import { createChatExpirationDate, createTempChatExpirationDate } from '~/utils/tempChatRetention';
+import { isAgentFadingTier, isAgentFadingTierEntries } from '~/utils/fading';
+import { isCompactionSemanticIndexProjection } from '~/types/compaction';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { isValidObjectIdString } from '~/utils/objectId';
 import { decrementTagCounts } from './conversationTag';
 import logger from '~/config/winston';
 
+const ACTOR_CHECKPOINT_FIELDS = [
+  'agentEventActor',
+  'agentEventActorCleanup',
+  'agentEventActorReconciliations',
+  'agentEventActorSuspension',
+] as const;
+
+function stripActorCheckpointFields(record: Record<string, unknown>): void {
+  for (const key of Object.keys(record)) {
+    if (ACTOR_CHECKPOINT_FIELDS.some((field) => key === field || key.startsWith(`${field}.`))) {
+      delete record[key];
+    }
+  }
+}
+
 const AGENT_EVENT_ACTOR_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60_000;
+const MAX_AGENT_EVENT_ACTOR_SUSPENSION_BYTES = 64 * 1_024;
+/** MeiliSearch's default `pagination.maxTotalHits` ceiling. */
+const MEILI_SEARCH_LIMIT = 1000;
+/** Ceiling for a single conversation page; the sidebar's largest request is 100. */
+const MAX_CONVO_PAGE_SIZE = 100;
+const DEFAULT_CONVO_PAGE_SIZE = 25;
+const escapeMeiliFilterValue = (value: string): string =>
+  value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+function validateAgentEventActorSuspension(
+  conversationId: string,
+  suspension: IAgentEventActorSuspensionEvidence,
+  actionId: string,
+  jobCreatedAt: number,
+  previous?: AgentEventActorSettlementAuthority,
+): void {
+  const invocation = suspension?.invocation;
+  const fork = invocation?.fork;
+  const checkpoint = suspension?.checkpoint;
+  if (
+    suspension?.version !== 1 ||
+    typeof suspension.suspensionId !== 'string' ||
+    suspension.suspensionId.length === 0 ||
+    !Number.isSafeInteger(suspension.attempt) ||
+    suspension.attempt < 0 ||
+    !Number.isSafeInteger(suspension.issuedAt) ||
+    !Number.isSafeInteger(suspension.expiresAt) ||
+    suspension.expiresAt <= suspension.issuedAt ||
+    invocation?.actorThreadId !== conversationId ||
+    fork?.threadId !== conversationId ||
+    checkpoint?.threadId !== conversationId ||
+    fork?.invocationId !== invocation?.invocationId ||
+    checkpoint?.invocationId !== invocation?.invocationId ||
+    checkpoint?.checkpointNs !== fork?.checkpointNs ||
+    typeof suspension.interrupt?.id !== 'string' ||
+    suspension.interrupt.id.length === 0 ||
+    typeof suspension.suspensionDigest !== 'string' ||
+    suspension.suspensionDigest.length === 0 ||
+    typeof actionId !== 'string' ||
+    actionId.length === 0 ||
+    !Number.isSafeInteger(jobCreatedAt) ||
+    jobCreatedAt < 0 ||
+    (previous == null ? suspension.attempt !== 0 : suspension.attempt !== previous.attempt + 1)
+  ) {
+    throw new Error('Event actor suspension evidence is invalid');
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(suspension);
+  } catch {
+    throw new Error('Event actor suspension evidence is not JSON-safe');
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_AGENT_EVENT_ACTOR_SUSPENSION_BYTES) {
+    throw new RangeError('Event actor suspension exceeds maximum payload size');
+  }
+}
 
 type ConversationUpdateResult = {
   value:
@@ -68,6 +158,12 @@ export type AgentEventActorCommitResult =
       prunableCheckpoint?: IAgentEventActorCheckpoint;
     }
   | { status: 'stale'; state?: IAgentEventActorState };
+
+export interface AgentEventActorSettlementAuthority {
+  suspensionId: string;
+  attempt: number;
+  resumeAttemptId: string;
+}
 
 export interface AgentEventActorReconciliationStorageMetrics {
   pending: number;
@@ -176,6 +272,8 @@ export interface ConversationMethods {
       noUpsert?: boolean;
       createdAtOnInsert?: Date;
       preserveUpdatedAt?: boolean;
+      /** Same-tenant persisted agent already resolved by the request layer. */
+      initialAgentId?: string | null;
       /** `_id`s of messages this save just wrote. When present, they are appended with
        *  `$addToSet` and the O(n) read-and-rewrite of the `messages` array is skipped;
        *  every save without this option still rebuilds the array from the database. */
@@ -245,7 +343,59 @@ export interface ConversationMethods {
     expected?: IAgentEventActorState;
     expectedEpoch: number;
     checkpoint: IAgentEventActorCheckpoint;
+    contextFingerprint?: IAgentEventActorState['contextFingerprint'];
+    skillManifest?: IAgentEventActorState['skillManifest'];
+    discoveredToolNames?: IAgentEventActorState['discoveredToolNames'];
+    summary?: IAgentEventActorState['summary'];
+    contextMeta?: IAgentEventActorState['contextMeta'];
+    compactionSemanticIndex?: IAgentEventActorState['compactionSemanticIndex'];
+    settlementAuthority?: AgentEventActorSettlementAuthority;
   }): Promise<AgentEventActorCommitResult>;
+  storeAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspension: IAgentEventActorSuspensionEvidence;
+    kind?: 'human_decision' | 'internal_completion';
+    appliedAction?: { toolName: string; toolCallId?: string };
+    handlingGenerationCreatedAt?: number;
+    actionId: string;
+    jobCreatedAt: number;
+    /** The segment applied its expected action before publishing this successor pause. */
+    invalidateHead?: boolean;
+    previous?: AgentEventActorSettlementAuthority;
+  }): Promise<{ status: 'stored' | 'stale' }>;
+  claimAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspensionId: string;
+    attempt: number;
+    actionId: string;
+    jobCreatedAt: number;
+    resumeAttemptId: string;
+  }): Promise<{ status: 'claimed' | 'stale' }>;
+  settleAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspensionId: string;
+    attempt: number;
+    resumeAttemptId: string;
+    invocationId: string;
+    checkpoint: IAgentEventActorReconciliation['checkpoint'];
+  }): Promise<{ status: 'settled' | 'stale' }>;
+  cancelAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspensionId: string;
+    attempt: number;
+    invocationId: string;
+    checkpoint: IAgentEventActorReconciliation['checkpoint'];
+    /** Exact orphaned resume claim proven not to have entered provider execution. */
+    claimedResumeAttemptId?: string;
+  }): Promise<{ status: 'cancelled' | 'stale' }>;
   beginAgentEventActorLegacyTurn(input: {
     user: string;
     conversationId: string;
@@ -336,27 +486,39 @@ export interface ConversationMethods {
   getConvoRetention(
     user: string,
     conversationId: string,
-  ): Promise<Pick<IConversation, 'expiredAt'> | null>;
+  ): Promise<Pick<IConversation, 'expiredAt' | 'isTemporary'> | null>;
   getConvoTitle(user: string, conversationId: string): Promise<string | null>;
   deleteConvos(
     user: string,
     filter: FilterQuery<IConversation>,
-    options?: { beforeDelete?: (conversationIds: string[]) => Promise<void> },
+    options?: {
+      beforeDelete?: (conversationIds: string[]) => Promise<void>;
+      allowEmpty?: boolean;
+    },
   ): Promise<DeleteResult & { messages: DeleteResult; conversationIds: string[] }>;
   archiveAllConvos(user: string): Promise<{ archivedCount: number }>;
 }
 
+export interface ConversationMethodDeps
+  extends Pick<MessageMethods, 'getMessages' | 'deleteMessages'> {
+  searchMessages?: MessageMethods['searchMessages'];
+  deleteAgentQueuedTurns?: (
+    user: string,
+    conversations: Array<{ conversationId: string; tenantId?: string; allTenants?: true }>,
+  ) => Promise<void>;
+}
+
 export function createConversationMethods(
   mongoose: typeof import('mongoose'),
-  messageMethods?: Pick<MessageMethods, 'getMessages' | 'deleteMessages'>,
+  deps?: ConversationMethodDeps,
 ): ConversationMethods {
   let legacyReceiptExpiryCursor: Types.ObjectId | undefined;
 
   function getMessageMethods() {
-    if (!messageMethods) {
+    if (!deps) {
       throw new Error('Message methods not injected into conversation methods');
     }
-    return messageMethods;
+    return deps;
   }
 
   function getVisibleConversationRetentionFilter(): FilterQuery<IConversation> {
@@ -494,6 +656,15 @@ export function createConversationMethods(
     };
   }
 
+  function readableActorSuspension(
+    suspension: IConversation['agentEventActorSuspension'],
+  ): IAgentEventActorSnapshot['suspension'] {
+    if (suspension == null) return null;
+    if (suspension.status === 'pending_owned') return { ...suspension, status: 'pending' };
+    if (suspension.status === 'claimed_owned') return { ...suspension, status: 'claimed' };
+    return suspension;
+  }
+
   /** Reads the private actor head and every fail-closed reconciliation marker. */
   async function getAgentEventActorSnapshot(input: {
     user: string;
@@ -510,7 +681,7 @@ export function createConversationMethods(
       ...activeExpirationFilter<IConversation>(),
     })
       .select(
-        '+agentEventActor +agentEventActorReconciliations +agentEventActorEpoch +agentEventActorLegacyTurn',
+        '+agentEventActor +agentEventActorReconciliations +agentEventActorEpoch +agentEventActorLegacyTurn +agentEventActorSuspension',
       )
       .lean<IConversation>();
     return conversation == null
@@ -519,8 +690,302 @@ export function createConversationMethods(
           state: conversation.agentEventActor ?? null,
           reconciliations: conversation.agentEventActorReconciliations ?? [],
           legacyTurn: conversation.agentEventActorLegacyTurn ?? null,
+          suspension: readableActorSuspension(conversation.agentEventActorSuspension),
           epoch: conversation.agentEventActorEpoch ?? 0,
         };
+  }
+
+  /** Publishes one SDK-issued suspension, or atomically replaces its exact claimed predecessor. */
+  async function storeAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspension: IAgentEventActorSuspensionEvidence;
+    kind?: 'human_decision' | 'internal_completion';
+    appliedAction?: { toolName: string; toolCallId?: string };
+    handlingGenerationCreatedAt?: number;
+    actionId: string;
+    jobCreatedAt: number;
+    invalidateHead?: boolean;
+    previous?: AgentEventActorSettlementAuthority;
+  }): Promise<{ status: 'stored' | 'stale' }> {
+    validateAgentEventActorSuspension(
+      input.conversationId,
+      input.suspension,
+      input.actionId,
+      input.jobCreatedAt,
+      input.previous,
+    );
+    const Conversation = mongoose.models.Conversation as Model<IConversation>;
+    const predecessor: FilterQuery<IConversation> =
+      input.previous == null
+        ? {
+            $or: [
+              { agentEventActorSuspension: { $exists: false } },
+              { 'agentEventActorSuspension.status': 'closed' },
+            ],
+          }
+        : {
+            'agentEventActorSuspension.status': { $in: ['claimed', 'claimed_owned'] },
+            'agentEventActorSuspension.suspension.suspensionId': input.previous.suspensionId,
+            'agentEventActorSuspension.suspension.attempt': input.previous.attempt,
+            'agentEventActorSuspension.resumeAttemptId': input.previous.resumeAttemptId,
+          };
+    const ownership = {
+      user: input.user,
+      conversationId: input.conversationId,
+      subagentThread: { $exists: true },
+      agentEventBinding: { $exists: true },
+      agentEventActorReconciliations: {
+        $elemMatch: {
+          invocationId: input.suspension.invocation.invocationId,
+          status: 'invocation_pending',
+        },
+      },
+      ...subagentLeaseTenantFilter(input.tenantId),
+      ...activeExpirationFilter<IConversation>(),
+      ...predecessor,
+    };
+    const suspension = {
+      suspension: input.suspension,
+      kind: input.kind ?? 'human_decision',
+      ...(input.appliedAction == null ? {} : { appliedAction: input.appliedAction }),
+      handlingGenerationCreatedAt: input.handlingGenerationCreatedAt ?? input.jobCreatedAt,
+      actionId: input.actionId,
+      jobCreatedAt: input.jobCreatedAt,
+      status: 'pending_owned' as const,
+      observedAt: new Date(),
+    };
+    const storeUpdate = {
+      $set: {
+        agentEventActorSuspension: suspension,
+        ...(input.invalidateHead === true ? { 'agentEventActor.requiresColdStart': true } : {}),
+      },
+    };
+    let stored = await Conversation.findOneAndUpdate(
+      {
+        ...ownership,
+        ...(input.invalidateHead === true ? { agentEventActor: { $exists: true } } : {}),
+      },
+      storeUpdate,
+      { new: false, timestamps: false },
+    )
+      .select('_id')
+      .lean<IConversation>();
+    /** A headless actor is already guaranteed to cold-start; publish the
+     * successor without manufacturing a partial canonical state. */
+    if (stored == null && input.invalidateHead === true) {
+      stored = await Conversation.findOneAndUpdate(
+        { ...ownership, agentEventActor: { $exists: false } },
+        {
+          $set: {
+            agentEventActorSuspension: suspension,
+          },
+        },
+        { new: false, timestamps: false },
+      )
+        .select('_id')
+        .lean<IConversation>();
+    }
+    return { status: stored == null ? 'stale' : 'stored' };
+  }
+
+  /** One resume attempt wins the canonical Conversation-side suspension fence. */
+  async function claimAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspensionId: string;
+    attempt: number;
+    actionId: string;
+    jobCreatedAt: number;
+    resumeAttemptId: string;
+  }): Promise<{ status: 'claimed' | 'stale' }> {
+    if (
+      input.suspensionId.length === 0 ||
+      !Number.isSafeInteger(input.attempt) ||
+      input.attempt < 0 ||
+      input.actionId.length === 0 ||
+      !Number.isSafeInteger(input.jobCreatedAt) ||
+      input.jobCreatedAt < 0 ||
+      input.resumeAttemptId.length === 0
+    ) {
+      throw new Error('Event actor suspension claim is invalid');
+    }
+    const Conversation = mongoose.models.Conversation as Model<IConversation>;
+    const claimed = await Conversation.findOneAndUpdate(
+      {
+        user: input.user,
+        conversationId: input.conversationId,
+        subagentThread: { $exists: true },
+        agentEventBinding: { $exists: true },
+        'agentEventActorSuspension.status': { $in: ['pending', 'pending_owned'] },
+        'agentEventActorSuspension.suspension.suspensionId': input.suspensionId,
+        'agentEventActorSuspension.suspension.attempt': input.attempt,
+        'agentEventActorSuspension.actionId': input.actionId,
+        'agentEventActorSuspension.jobCreatedAt': input.jobCreatedAt,
+        ...subagentLeaseTenantFilter(input.tenantId),
+        ...activeExpirationFilter<IConversation>(),
+      },
+      {
+        $set: {
+          'agentEventActorSuspension.status': 'claimed_owned',
+          'agentEventActorSuspension.resumeAttemptId': input.resumeAttemptId,
+          'agentEventActorSuspension.observedAt': new Date(),
+        },
+        $unset: {
+          'agentEventActorSuspension.outcome': 1,
+          'agentEventActorSuspension.closedAt': 1,
+        },
+      },
+      { new: false, timestamps: false },
+    )
+      .select('_id')
+      .lean<IConversation>();
+    return { status: claimed == null ? 'stale' : 'claimed' };
+  }
+
+  /** Closes a claimed no-action suspension while retaining one bounded retry receipt. */
+  async function settleAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspensionId: string;
+    attempt: number;
+    resumeAttemptId: string;
+    invocationId: string;
+    checkpoint: IAgentEventActorReconciliation['checkpoint'];
+  }): Promise<{ status: 'settled' | 'stale' }> {
+    const Conversation = mongoose.models.Conversation as Model<IConversation>;
+    const settled = await Conversation.findOneAndUpdate(
+      {
+        user: input.user,
+        conversationId: input.conversationId,
+        'agentEventActorSuspension.status': { $in: ['claimed', 'claimed_owned'] },
+        'agentEventActorSuspension.suspension.suspensionId': input.suspensionId,
+        'agentEventActorSuspension.suspension.attempt': input.attempt,
+        'agentEventActorSuspension.resumeAttemptId': input.resumeAttemptId,
+        agentEventActorReconciliations: {
+          $elemMatch: {
+            invocationId: input.invocationId,
+            status: 'invocation_pending',
+            'checkpoint.threadId': input.checkpoint.threadId,
+            'checkpoint.checkpointNs': input.checkpoint.checkpointNs,
+            ...(input.checkpoint.checkpointId == null
+              ? { 'checkpoint.checkpointId': { $exists: false } }
+              : { 'checkpoint.checkpointId': input.checkpoint.checkpointId }),
+          },
+        },
+        ...subagentLeaseTenantFilter(input.tenantId),
+      },
+      {
+        $set: {
+          'agentEventActorSuspension.status': 'closed',
+          'agentEventActorSuspension.outcome': 'settled',
+          'agentEventActorSuspension.closedAt': new Date(),
+          'agentEventActorSuspension.observedAt': new Date(),
+        },
+        $pull: {
+          agentEventActorReconciliations: {
+            invocationId: input.invocationId,
+            status: 'invocation_pending',
+            'checkpoint.threadId': input.checkpoint.threadId,
+            'checkpoint.checkpointNs': input.checkpoint.checkpointNs,
+            ...(input.checkpoint.checkpointId == null
+              ? { 'checkpoint.checkpointId': { $exists: false } }
+              : { 'checkpoint.checkpointId': input.checkpoint.checkpointId }),
+          },
+        },
+      },
+      { new: false, timestamps: false },
+    )
+      .select('_id')
+      .lean<IConversation>();
+    if (settled != null) {
+      return { status: 'settled' };
+    }
+    const snapshot = await getAgentEventActorSnapshot(input);
+    return snapshot?.suspension?.status === 'closed' &&
+      snapshot.suspension.outcome === 'settled' &&
+      snapshot.suspension.suspension.suspensionId === input.suspensionId &&
+      snapshot.suspension.suspension.attempt === input.attempt &&
+      snapshot.suspension.resumeAttemptId === input.resumeAttemptId
+      ? { status: 'settled' }
+      : { status: 'stale' };
+  }
+
+  /** Cancellation races resume through the same current-suspension predicate. */
+  async function cancelAgentEventActorSuspension(input: {
+    user: string;
+    conversationId: string;
+    tenantId?: string;
+    suspensionId: string;
+    attempt: number;
+    invocationId: string;
+    checkpoint: IAgentEventActorReconciliation['checkpoint'];
+    claimedResumeAttemptId?: string;
+  }): Promise<{ status: 'cancelled' | 'stale' }> {
+    const Conversation = mongoose.models.Conversation as Model<IConversation>;
+    const suspensionOwner =
+      input.claimedResumeAttemptId == null
+        ? { 'agentEventActorSuspension.status': { $in: ['pending', 'pending_owned'] } }
+        : {
+            'agentEventActorSuspension.status': { $in: ['claimed', 'claimed_owned'] },
+            'agentEventActorSuspension.resumeAttemptId': input.claimedResumeAttemptId,
+          };
+    const cancelled = await Conversation.findOneAndUpdate(
+      {
+        user: input.user,
+        conversationId: input.conversationId,
+        ...suspensionOwner,
+        'agentEventActorSuspension.suspension.suspensionId': input.suspensionId,
+        'agentEventActorSuspension.suspension.attempt': input.attempt,
+        agentEventActorReconciliations: {
+          $elemMatch: {
+            invocationId: input.invocationId,
+            status: 'invocation_pending',
+            'checkpoint.threadId': input.checkpoint.threadId,
+            'checkpoint.checkpointNs': input.checkpoint.checkpointNs,
+            ...(input.checkpoint.checkpointId == null
+              ? { 'checkpoint.checkpointId': { $exists: false } }
+              : { 'checkpoint.checkpointId': input.checkpoint.checkpointId }),
+          },
+        },
+        ...subagentLeaseTenantFilter(input.tenantId),
+      },
+      {
+        $set: {
+          'agentEventActorSuspension.status': 'closed',
+          'agentEventActorSuspension.outcome': 'cancelled',
+          'agentEventActorSuspension.closedAt': new Date(),
+          'agentEventActorSuspension.observedAt': new Date(),
+        },
+        $pull: {
+          agentEventActorReconciliations: {
+            invocationId: input.invocationId,
+            status: 'invocation_pending',
+            'checkpoint.threadId': input.checkpoint.threadId,
+            'checkpoint.checkpointNs': input.checkpoint.checkpointNs,
+            ...(input.checkpoint.checkpointId == null
+              ? { 'checkpoint.checkpointId': { $exists: false } }
+              : { 'checkpoint.checkpointId': input.checkpoint.checkpointId }),
+          },
+        },
+      },
+      { new: false, timestamps: false },
+    )
+      .select('_id')
+      .lean<IConversation>();
+    if (cancelled != null) {
+      return { status: 'cancelled' };
+    }
+    const snapshot = await getAgentEventActorSnapshot(input);
+    return snapshot?.suspension?.status === 'closed' &&
+      snapshot.suspension.outcome === 'cancelled' &&
+      snapshot.suspension.suspension.suspensionId === input.suspensionId &&
+      snapshot.suspension.suspension.attempt === input.attempt
+      ? { status: 'cancelled' }
+      : { status: 'stale' };
   }
 
   /** Advances one actor head only when its complete prior identity still matches. */
@@ -533,9 +998,62 @@ export function createConversationMethods(
     expected?: IAgentEventActorState;
     expectedEpoch: number;
     checkpoint: IAgentEventActorCheckpoint;
+    contextFingerprint?: IAgentEventActorState['contextFingerprint'];
+    skillManifest?: IAgentEventActorState['skillManifest'];
+    discoveredToolNames?: IAgentEventActorState['discoveredToolNames'];
+    summary?: IAgentEventActorState['summary'];
+    contextMeta?: IAgentEventActorState['contextMeta'];
+    compactionSemanticIndex?: IAgentEventActorState['compactionSemanticIndex'];
+    settlementAuthority?: AgentEventActorSettlementAuthority;
   }): Promise<AgentEventActorCommitResult> {
     if (input.checkpoint.threadId !== input.conversationId) {
       throw new Error('Event actor checkpoint changed its logical thread');
+    }
+    if ((input.skillManifest?.length ?? 0) > MAX_AGENT_EVENT_ACTOR_SKILLS) {
+      throw new RangeError(`Event actor Skill manifest exceeds ${MAX_AGENT_EVENT_ACTOR_SKILLS}`);
+    }
+    if (
+      (input.discoveredToolNames?.length ?? 0) > MAX_AGENT_EVENT_ACTOR_DISCOVERED_TOOLS ||
+      input.discoveredToolNames?.some(
+        (name) => name.length === 0 || name.length > MAX_AGENT_EVENT_ACTOR_TOOL_NAME_LENGTH,
+      )
+    ) {
+      throw new RangeError('Event actor discovered-tool state is invalid');
+    }
+    if (
+      input.summary != null &&
+      (input.summary.text.length === 0 ||
+        input.summary.text.length > MAX_AGENT_EVENT_ACTOR_SUMMARY_LENGTH ||
+        !Number.isFinite(input.summary.tokenCount) ||
+        input.summary.tokenCount < 0)
+    ) {
+      throw new RangeError('Event actor summary state is invalid');
+    }
+    if (
+      input.contextMeta != null &&
+      (!Number.isFinite(input.contextMeta.calibrationRatio) ||
+        input.contextMeta.calibrationRatio < 0.5 ||
+        input.contextMeta.calibrationRatio > 5 ||
+        (input.contextMeta.encoding != null &&
+          (input.contextMeta.encoding.length === 0 ||
+            input.contextMeta.encoding.length > MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH)))
+    ) {
+      throw new RangeError('Event actor context calibration is invalid');
+    }
+    if (
+      input.contextMeta?.fadingTiers != null &&
+      !isAgentFadingTierEntries(input.contextMeta.fadingTiers)
+    ) {
+      throw new RangeError('Event actor context fading tiers are invalid');
+    }
+    if (input.contextMeta?.fading != null && !isAgentFadingTier(input.contextMeta.fading)) {
+      throw new RangeError('Event actor context fading tier is invalid');
+    }
+    if (
+      input.compactionSemanticIndex != null &&
+      !isCompactionSemanticIndexProjection(input.compactionSemanticIndex)
+    ) {
+      throw new RangeError('Event actor compaction semantic index is invalid');
     }
     const Conversation = mongoose.models.Conversation as Model<IConversation>;
     /** A legacy turn against a headless or already cold-marked actor leaves
@@ -555,13 +1073,63 @@ export function createConversationMethods(
             'agentEventActor.checkpoint.threadId': input.expected.checkpoint.threadId,
             'agentEventActor.checkpoint.checkpointId': input.expected.checkpoint.checkpointId,
             'agentEventActor.checkpoint.checkpointNs': input.expected.checkpoint.checkpointNs,
+            'agentEventActor.previousCheckpoint': input.expected.previousCheckpoint ?? {
+              $exists: false,
+            },
+            ...(input.expected.contextFingerprint == null
+              ? { 'agentEventActor.contextFingerprint': { $exists: false } }
+              : {
+                  'agentEventActor.contextFingerprint.algorithm':
+                    input.expected.contextFingerprint.algorithm,
+                  'agentEventActor.contextFingerprint.version':
+                    input.expected.contextFingerprint.version,
+                  'agentEventActor.contextFingerprint.digest':
+                    input.expected.contextFingerprint.digest,
+                }),
+            ...(input.expected.skillManifest == null
+              ? { 'agentEventActor.skillManifest': { $exists: false } }
+              : { 'agentEventActor.skillManifest': input.expected.skillManifest }),
+            ...(input.expected.discoveredToolNames == null
+              ? { 'agentEventActor.discoveredToolNames': { $exists: false } }
+              : { 'agentEventActor.discoveredToolNames': input.expected.discoveredToolNames }),
+            ...(input.expected.summary == null
+              ? { 'agentEventActor.summary': { $exists: false } }
+              : { 'agentEventActor.summary': input.expected.summary }),
+            ...(input.expected.contextMeta == null
+              ? { 'agentEventActor.contextMeta': { $exists: false } }
+              : { 'agentEventActor.contextMeta': input.expected.contextMeta }),
+            ...(input.expected.compactionSemanticIndex == null
+              ? { 'agentEventActor.compactionSemanticIndex': { $exists: false } }
+              : {
+                  'agentEventActor.compactionSemanticIndex': input.expected.compactionSemanticIndex,
+                }),
             'agentEventActor.requiresColdStart':
               input.expected.requiresColdStart === true ? true : { $ne: true },
           }),
     };
+    const settlementFilter: FilterQuery<IConversation> =
+      input.settlementAuthority == null
+        ? {}
+        : {
+            'agentEventActorSuspension.status': { $in: ['claimed', 'claimed_owned'] },
+            'agentEventActorSuspension.suspension.suspensionId':
+              input.settlementAuthority.suspensionId,
+            'agentEventActorSuspension.suspension.attempt': input.settlementAuthority.attempt,
+            'agentEventActorSuspension.resumeAttemptId': input.settlementAuthority.resumeAttemptId,
+          };
     const nextState: IAgentEventActorState = {
       generation: (input.expected?.generation ?? 0) + 1,
       checkpoint: input.checkpoint,
+      ...(input.contextFingerprint == null ? {} : { contextFingerprint: input.contextFingerprint }),
+      ...(input.skillManifest == null ? {} : { skillManifest: input.skillManifest }),
+      ...(input.discoveredToolNames == null
+        ? {}
+        : { discoveredToolNames: input.discoveredToolNames }),
+      ...(input.summary == null ? {} : { summary: input.summary }),
+      ...(input.contextMeta == null ? {} : { contextMeta: input.contextMeta }),
+      ...(input.compactionSemanticIndex == null
+        ? {}
+        : { compactionSemanticIndex: input.compactionSemanticIndex }),
       ...(input.expected == null ? {} : { previousCheckpoint: input.expected.checkpoint }),
     };
     const previous = await Conversation.findOneAndUpdate(
@@ -579,6 +1147,7 @@ export function createConversationMethods(
         ...subagentLeaseTenantFilter(input.tenantId),
         ...activeExpirationFilter<IConversation>(),
         ...expectedFilter,
+        ...settlementFilter,
       },
       {
         $set: {
@@ -587,12 +1156,25 @@ export function createConversationMethods(
           'agentEventActorReconciliations.$.checkpoint': input.checkpoint,
           'agentEventActorReconciliations.$.action': input.action,
           'agentEventActorReconciliations.$.observedAt': new Date(),
+          ...(input.settlementAuthority == null
+            ? {}
+            : {
+                'agentEventActorSuspension.status': 'closed',
+                'agentEventActorSuspension.outcome': 'committed',
+                'agentEventActorSuspension.closedAt': new Date(),
+                'agentEventActorSuspension.observedAt': new Date(),
+              }),
         },
+        ...(input.expected?.previousCheckpoint == null
+          ? {}
+          : {
+              $addToSet: { agentEventActorCleanup: input.expected.previousCheckpoint },
+            }),
         $unset: { 'agentEventActorReconciliations.$.error': 1 },
       },
       { new: false, timestamps: false },
     )
-      .select('+agentEventActor')
+      .select('+agentEventActor +agentEventActorSuspension')
       .lean<IConversation>();
     if (previous != null) {
       return {
@@ -601,6 +1183,70 @@ export function createConversationMethods(
         ...(previous.agentEventActor?.previousCheckpoint == null
           ? {}
           : { prunableCheckpoint: previous.agentEventActor.previousCheckpoint }),
+      };
+    }
+    if (input.settlementAuthority != null) {
+      /** A resumed action must close its claim even when another head won.
+       * The negative full-head predicate makes this mutually exclusive with
+       * the commit CAS above; the retained closure is the ambiguous-reply receipt. */
+      const closedStale = await Conversation.findOneAndUpdate(
+        {
+          user: input.user,
+          conversationId: input.conversationId,
+          subagentThread: { $exists: true },
+          agentEventBinding: { $exists: true },
+          agentEventActorReconciliations: {
+            $elemMatch: {
+              invocationId: input.invocationId,
+              status: 'invocation_pending',
+            },
+          },
+          ...subagentLeaseTenantFilter(input.tenantId),
+          ...activeExpirationFilter<IConversation>(),
+          ...settlementFilter,
+          $nor: [expectedFilter],
+        },
+        {
+          $set: {
+            'agentEventActorSuspension.status': 'closed',
+            'agentEventActorSuspension.outcome': 'stale',
+            'agentEventActorSuspension.closedAt': new Date(),
+            'agentEventActorSuspension.observedAt': new Date(),
+          },
+        },
+        { new: false, timestamps: false },
+      )
+        .select('+agentEventActor +agentEventActorSuspension')
+        .lean<IConversation>();
+      if (closedStale != null) {
+        return {
+          status: 'stale',
+          ...(closedStale.agentEventActor == null ? {} : { state: closedStale.agentEventActor }),
+        };
+      }
+      const current = await getAgentEventActorSnapshot(input);
+      const receipt = current?.suspension;
+      const matchesAuthority =
+        receipt?.suspension.suspensionId === input.settlementAuthority.suspensionId &&
+        receipt?.suspension.attempt === input.settlementAuthority.attempt &&
+        receipt?.resumeAttemptId === input.settlementAuthority.resumeAttemptId;
+      if (matchesAuthority && receipt?.status === 'closed') {
+        if (receipt.outcome === 'committed' && current?.state != null) {
+          return { status: 'committed', state: current.state };
+        }
+        if (receipt.outcome === 'stale') {
+          return {
+            status: 'stale',
+            ...(current?.state == null ? {} : { state: current.state }),
+          };
+        }
+      }
+      if (matchesAuthority) {
+        throw new Error('Resumed event actor commit could not close its suspension fence');
+      }
+      return {
+        status: 'stale',
+        ...(current?.state == null ? {} : { state: current.state }),
       };
     }
     const current = await getAgentEventActorSnapshot(input);
@@ -1136,7 +1782,16 @@ export function createConversationMethods(
     const candidates = await Conversation.find({
       ...(legacyReceiptExpiryCursor == null ? {} : { _id: { $gt: legacyReceiptExpiryCursor } }),
     })
-      .select('_id +agentEventActorReconciliations')
+      /** Pure inclusion, as an object. The string form
+       * `'_id +agentEventActorReconciliations'` compiles to `{ _id: 1 }` plus a
+       * `: 0` exclusion for every OTHER `select: false` sibling — the `+` token
+       * only un-hides its field and `_id` alone does not make the projection
+       * inclusive. MongoDB tolerates that mixed shape via the `_id` exception;
+       * Amazon DocumentDB rejects it, which failed this sweep on every pass and
+       * took the sequenced lane reclamation down with it. An explicit `1` for a
+       * `select: false` path overrides the schema default, so nothing hidden
+       * leaks and nothing extra is fetched. */
+      .select({ _id: 1, agentEventActorReconciliations: 1 })
       .sort({ _id: 1 })
       .limit(boundedLimit)
       .lean<
@@ -1414,11 +2069,11 @@ export function createConversationMethods(
   async function getConvoRetention(
     user: string,
     conversationId: string,
-  ): Promise<Pick<IConversation, 'expiredAt'> | null> {
+  ): Promise<Pick<IConversation, 'expiredAt' | 'isTemporary'> | null> {
     try {
       const Conversation = mongoose.models.Conversation as Model<IConversation>;
-      return await Conversation.findOne({ user, conversationId }, 'expiredAt').lean<
-        Pick<IConversation, 'expiredAt'>
+      return await Conversation.findOne({ user, conversationId }, 'expiredAt isTemporary').lean<
+        Pick<IConversation, 'expiredAt' | 'isTemporary'>
       >();
     } catch (error) {
       logger.error('[getConvoRetention] Error getting conversation retention fields', error);
@@ -1503,6 +2158,7 @@ export function createConversationMethods(
       noUpsert?: boolean;
       createdAtOnInsert?: Date;
       preserveUpdatedAt?: boolean;
+      initialAgentId?: string | null;
       appendMessageIds?: Types.ObjectId[];
     },
   ) {
@@ -1516,12 +2172,18 @@ export function createConversationMethods(
 
       const appendMessageIds = metadata?.appendMessageIds;
       const update: Record<string, unknown> = { ...convo, user: userId };
+      delete update.isTemporary;
+      delete update.expiredAt;
+      delete update.initial_agent_id;
+      stripActorCheckpointFields(update);
       if (appendMessageIds == null) {
         update.messages = await getMessages({ conversationId, user: userId }, '_id');
       } else {
         delete update.messages;
       }
       const unsetFields: Record<string, number> = { ...(metadata?.unsetFields ?? {}) };
+      delete unsetFields.initial_agent_id;
+      stripActorCheckpointFields(unsetFields);
 
       if (Object.prototype.hasOwnProperty.call(update, 'chatProjectId') && update.chatProjectId) {
         const chatProjectId = typeof update.chatProjectId === 'string' ? update.chatProjectId : '';
@@ -1558,6 +2220,7 @@ export function createConversationMethods(
         update.conversationId = newConversationId;
       }
 
+      let retentionOnInsert: { expiredAt: Date; isTemporary: false } | undefined;
       if (expiredAt instanceof Date && !Number.isNaN(expiredAt.getTime())) {
         if (typeof isTemporary === 'boolean') {
           update.isTemporary = isTemporary;
@@ -1567,12 +2230,31 @@ export function createConversationMethods(
         if (typeof isTemporary === 'boolean') {
           update.isTemporary = isTemporary;
         }
-        try {
-          update.expiredAt = createTempChatExpirationDate(interfaceConfig);
-        } catch (err) {
-          logger.error('Error creating temporary chat expiration date:', err);
-          logger.info(`---\`saveConvo\` context: ${metadata?.context}`);
-          update.expiredAt = createFallbackRetentionDate();
+        if (
+          typeof isTemporary === 'boolean' ||
+          interfaceConfig.generalChatRetention === undefined
+        ) {
+          try {
+            update.expiredAt = createChatExpirationDate(interfaceConfig, isTemporary);
+          } catch (err) {
+            logger.error('Error creating chat expiration date:', err);
+            logger.info(`---\`saveConvo\` context: ${metadata?.context}`);
+            update.expiredAt = createFallbackRetentionDate();
+          }
+        } else {
+          try {
+            retentionOnInsert = {
+              expiredAt: createChatExpirationDate(interfaceConfig, false),
+              isTemporary: false,
+            };
+          } catch (err) {
+            logger.error('Error creating chat expiration date:', err);
+            logger.info(`---\`saveConvo\` context: ${metadata?.context}`);
+            retentionOnInsert = {
+              expiredAt: createFallbackRetentionDate(),
+              isTemporary: false,
+            };
+          }
         }
       } else if (isTemporary === true) {
         update.isTemporary = true;
@@ -1608,6 +2290,14 @@ export function createConversationMethods(
         timestampOptions.timestamps = false;
       }
 
+      const canUpsert = metadata?.noUpsert !== true;
+      const initialAgentId =
+        canUpsert &&
+        typeof metadata?.initialAgentId === 'string' &&
+        metadata.initialAgentId.trim() !== ''
+          ? metadata.initialAgentId
+          : null;
+
       const buildOperation = (setFields: Record<string, unknown>) => {
         const operation: Record<string, unknown> = { $set: setFields };
         if (appendMessageIds != null && appendMessageIds.length > 0) {
@@ -1620,14 +2310,15 @@ export function createConversationMethods(
           ? (createdAtOnInsert ??
             (!preserveUpdatedAt && update.updatedAt instanceof Date ? update.updatedAt : undefined))
           : createdAtOnInsert;
-        if (createdAtForInsert) {
-          operation.$setOnInsert = { createdAt: createdAtForInsert };
-        }
+        operation.$setOnInsert = {
+          initial_agent_id: initialAgentId,
+          ...retentionOnInsert,
+          ...(createdAtForInsert ? { createdAt: createdAtForInsert } : {}),
+        };
         return operation;
       };
 
       const baseFilter = { conversationId, user: userId };
-      const canUpsert = metadata?.noUpsert !== true;
       const runUpdate = (
         filter: Record<string, unknown>,
         operation: Record<string, unknown>,
@@ -1706,6 +2397,31 @@ export function createConversationMethods(
       if (!conversation) {
         logger.debug('[saveConvo] Conversation not found, skipping update');
         return null;
+      }
+
+      /** Reuse the saved row's chat type when callers omit it, preserving existing deadlines. */
+      if (
+        interfaceConfig?.retentionMode === RetentionMode.ALL &&
+        interfaceConfig.generalChatRetention !== undefined &&
+        typeof isTemporary !== 'boolean' &&
+        conversation.expiredAt == null
+      ) {
+        const deadline = createChatExpirationDate(
+          interfaceConfig,
+          conversation.isTemporary === true,
+        );
+        const result = await Conversation.updateOne(
+          {
+            _id: conversation._id,
+            expiredAt: null,
+            isTemporary: conversation.isTemporary === true ? true : { $ne: true },
+          },
+          { $set: { expiredAt: deadline } },
+          { timestamps: false },
+        );
+        if (result.modifiedCount > 0) {
+          conversation.expiredAt = deadline;
+        }
       }
 
       if (
@@ -1886,6 +2602,8 @@ export function createConversationMethods(
       const affectedProjectStats = new Map<string, { user: string; projectId: string }>();
       const bulkOps = conversations.map((convo) => {
         const sanitized = { ...convo };
+        delete sanitized.initial_agent_id;
+        stripActorCheckpointFields(sanitized);
         if (typeof sanitized.user === 'string' && typeof sanitized.chatProjectId === 'string') {
           if (ownedProjects.has(`${sanitized.user}:${sanitized.chatProjectId}`)) {
             affectedProjectStats.set(`${sanitized.user}:${sanitized.chatProjectId}`, {
@@ -1915,7 +2633,10 @@ export function createConversationMethods(
               conversationId: sanitized.conversationId,
               user: sanitized.user,
             },
-            update: sanitized,
+            update: {
+              $set: sanitized,
+              $setOnInsert: { initial_agent_id: null },
+            },
             upsert: true,
             timestamps: false,
           },
@@ -1978,7 +2699,7 @@ export function createConversationMethods(
     user: string,
     {
       cursor,
-      limit = 25,
+      limit = DEFAULT_CONVO_PAGE_SIZE,
       isArchived = false,
       pinned = false,
       tags,
@@ -1998,7 +2719,13 @@ export function createConversationMethods(
       projectId?: string;
     } = {},
   ) {
-    const Conversation = mongoose.models.Conversation as Model<IConversation>;
+    const Conversation = mongoose.models.Conversation as Model<IConversation> &
+      Pick<SchemaWithMeiliMethods, 'meiliSearch'>;
+    /* `.limit(0)` is "no limit" to MongoDB and a negative one caps to a single batch, so an
+       unclamped page size hands the caller the whole collection rather than a page of it. */
+    const pageSize = Number.isFinite(limit)
+      ? Math.min(Math.max(Math.trunc(limit), 1), MAX_CONVO_PAGE_SIZE)
+      : DEFAULT_CONVO_PAGE_SIZE;
     const filters: FilterQuery<IConversation>[] = [{ user } as FilterQuery<IConversation>];
     if (isArchived) {
       filters.push({ isArchived: true } as FilterQuery<IConversation>);
@@ -2029,23 +2756,43 @@ export function createConversationMethods(
 
     if (search) {
       try {
-        const meiliResults = await (
-          Conversation as unknown as {
-            meiliSearch: (
-              query: string,
-              options: Record<string, string>,
-            ) => Promise<{
-              hits: Array<{ conversationId: string }>;
-            }>;
+        const searchParams: SearchParams = {
+          filter: `user = "${escapeMeiliFilterValue(user)}"`,
+          limit: MEILI_SEARCH_LIMIT,
+          attributesToRetrieve: ['conversationId', 'originalConversationId'],
+        };
+        const [convoResults, messageHits] = await Promise.all([
+          Conversation.meiliSearch(search, searchParams),
+          deps?.searchMessages
+            ? deps.searchMessages(search, searchParams).then(
+                (results) => (Array.isArray(results.hits) ? results.hits : []),
+                (error) => {
+                  logger.error(
+                    '[getConvosByCursor] Message search failed, using title matches only',
+                    error,
+                  );
+                  return [];
+                },
+              )
+            : [],
+        ]);
+        const matchingIds = new Set<string>();
+        for (const hit of convoResults.hits ?? []) {
+          if (typeof hit.conversationId === 'string') {
+            matchingIds.add(hit.conversationId);
           }
-        ).meiliSearch(search, { filter: `user = "${user}"` });
-        const matchingIds = Array.isArray(meiliResults.hits)
-          ? meiliResults.hits.map((result) => result.conversationId)
-          : [];
-        if (!matchingIds.length) {
+        }
+        for (const hit of messageHits) {
+          if (typeof hit.conversationId === 'string') {
+            matchingIds.add(hit.conversationId);
+          }
+        }
+        if (!matchingIds.size) {
           return { conversations: [], nextCursor: null };
         }
-        filters.push({ conversationId: { $in: matchingIds } } as FilterQuery<IConversation>);
+        filters.push({
+          conversationId: { $in: [...matchingIds] },
+        } as FilterQuery<IConversation>);
       } catch (error) {
         logger.error('[getConvosByCursor] Error during meiliSearch', error);
         throw new Error('Error during meiliSearch');
@@ -2149,15 +2896,18 @@ export function createConversationMethods(
       sortObj._id = sortOrder;
 
       const convos = await Conversation.find(query)
+        /* `isArchived` rides along so a row can offer archive or restore from its own state:
+           the sidebar lists archived and unarchived chats in the same session, and the
+           active list also carries the unarchived pins beside them. */
         .select(
-          'conversationId endpoint title createdAt updatedAt archivedAt user model agent_id assistant_id spec iconURL chatProjectId pinned',
+          'conversationId endpoint title createdAt updatedAt archivedAt isArchived user model agent_id assistant_id spec iconURL chatProjectId pinned',
         )
         .sort(sortObj)
-        .limit(limit + 1)
+        .limit(pageSize + 1)
         .lean<IConversation[]>();
 
       let nextCursor: string | null = null;
-      if (convos.length > limit) {
+      if (convos.length > pageSize) {
         convos.pop();
         const lastReturned = convos[convos.length - 1];
         const sortValues: Record<string, string | Date | null | undefined> = {
@@ -2276,13 +3026,21 @@ export function createConversationMethods(
   async function deleteConvos(
     user: string,
     filter: FilterQuery<IConversation>,
-    options?: { beforeDelete?: (conversationIds: string[]) => Promise<void> },
+    options?: {
+      beforeDelete?: (conversationIds: string[]) => Promise<void>;
+      /** Idempotent destructive-recovery mode. An empty selection is success, while
+       * query, cascade, reconciliation, and deletion failures still propagate. */
+      allowEmpty?: boolean;
+    },
   ) {
     try {
       const Conversation = mongoose.models.Conversation as Model<IConversation>;
       const { deleteMessages, getMessages } = getMessageMethods();
       const userFilter = { ...filter, user };
-      type DeletionConversation = Pick<IConversation, 'conversationId' | 'chatProjectId' | 'tags'>;
+      type DeletionConversation = Pick<
+        IConversation,
+        'conversationId' | 'tenantId' | 'chatProjectId' | 'tags'
+      >;
       const retryCascadeOperation = async <T>(operation: () => PromiseLike<T> | T): Promise<T> => {
         let lastError: unknown;
         for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -2298,7 +3056,7 @@ export function createConversationMethods(
         throw lastError;
       };
       let conversations = await Conversation.find(userFilter)
-        .select('conversationId chatProjectId tags')
+        .select('conversationId tenantId chatProjectId tags')
         .lean<DeletionConversation[]>();
       const recoveryConversationIds: string[] = [];
       if (!conversations.length && typeof filter.conversationId === 'string') {
@@ -2312,17 +3070,25 @@ export function createConversationMethods(
               user,
               'subagentThread.rootConversationId': filter.conversationId,
             })
-              .select('conversationId chatProjectId tags')
+              .select('conversationId tenantId chatProjectId tags')
               .lean<DeletionConversation[]>(),
           ),
           getMessages({ user, conversationId: filter.conversationId }, '_id', { limit: 1 }),
         ]);
-        if (descendants.length === 0 && rootMessages.length === 0) {
+        if (descendants.length === 0 && rootMessages.length === 0 && options?.allowEmpty !== true) {
           throw new Error('Conversation not found or already deleted.');
         }
         conversations = descendants;
         recoveryConversationIds.push(filter.conversationId);
       } else if (!conversations.length) {
+        if (options?.allowEmpty === true) {
+          return {
+            acknowledged: true,
+            deletedCount: 0,
+            messages: { acknowledged: true, deletedCount: 0 },
+            conversationIds: [],
+          };
+        }
         throw new Error('Conversation not found or already deleted.');
       }
 
@@ -2379,6 +3145,13 @@ export function createConversationMethods(
           break;
         }
         const waveIds = wave.map((conversation) => conversation.conversationId);
+        await deps?.deleteAgentQueuedTurns?.(
+          user,
+          wave.map((conversation) => ({
+            conversationId: conversation.conversationId,
+            ...(conversation.tenantId != null && { tenantId: conversation.tenantId }),
+          })),
+        );
         await options?.beforeDelete?.(waveIds);
         const result = await Conversation.deleteMany({ user, conversationId: { $in: waveIds } });
         acknowledged &&= result.acknowledged;
@@ -2393,7 +3166,7 @@ export function createConversationMethods(
             user,
             'subagentThread.parentConversationId': { $in: waveIds },
           })
-            .select('conversationId chatProjectId tags')
+            .select('conversationId tenantId chatProjectId tags')
             .lean<DeletionConversation[]>(),
         );
       }
@@ -2402,6 +3175,16 @@ export function createConversationMethods(
         ...recoveryConversationIds,
         ...deletedConversations.map((conversation) => conversation.conversationId),
       ];
+
+      if (recoveryConversationIds.length > 0) {
+        await deps?.deleteAgentQueuedTurns?.(
+          user,
+          recoveryConversationIds.map((conversationId) => ({
+            conversationId,
+            allTenants: true,
+          })),
+        );
+      }
 
       const deleteConvoResult: DeleteResult = { acknowledged, deletedCount };
 
@@ -2574,6 +3357,10 @@ export function createConversationMethods(
     getAgentEventBinding,
     getAgentEventActorSnapshot,
     commitAgentEventActorState,
+    storeAgentEventActorSuspension,
+    claimAgentEventActorSuspension,
+    settleAgentEventActorSuspension,
+    cancelAgentEventActorSuspension,
     beginAgentEventActorLegacyTurn,
     completeAgentEventActorLegacyTurn,
     recordAgentEventActorReconciliation,

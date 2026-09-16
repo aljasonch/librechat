@@ -1,8 +1,11 @@
 import type { Agents } from 'librechat-data-provider';
+import {
+  GenerationPublicationFencedError,
+  PAUSE_PERSISTENCE_TIMEOUT_ERROR,
+} from '~/stream/interfaces/IJobStore';
 import { ApprovalLifecycle, PendingActionExpiredError } from '~/stream/ApprovalLifecycle';
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
-import { PAUSE_PERSISTENCE_TIMEOUT_ERROR } from '~/stream/interfaces/IJobStore';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
 
@@ -247,6 +250,71 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
 
       const paused = await manager.getJob(streamId);
       expect(paused?.metadata.activityPhaseSnapshot).toEqual(activityPhaseSnapshot);
+    });
+
+    test('persists compaction guidance in the same transition as the pause', async () => {
+      const streamId = 'stream-pause-compaction-index';
+      await manager.createJob(streamId, 'user-1');
+      const compactionSemanticIndex = {
+        version: 1 as const,
+        entries: [
+          {
+            type: 'activity_phase' as const,
+            sourceMessageId: 'assistant-history',
+            sourceContentIndex: 1,
+            revision: 1,
+            status: 'committed' as const,
+            text: 'Verified the release state',
+          },
+        ],
+      };
+
+      expect(
+        await manager.approvals.pause(streamId, buildAction(streamId), {
+          compactionSemanticIndex,
+        }),
+      ).toBe(true);
+
+      const paused = await manager.getJob(streamId);
+      expect(paused?.metadata.compactionSemanticIndex).toEqual(compactionSemanticIndex);
+    });
+
+    test('persists context meta in the same transition as the pause', async () => {
+      const streamId = 'stream-pause-context-meta';
+      await manager.createJob(streamId, 'user-1');
+      const contextMeta = {
+        calibrationRatio: 1.25,
+        encoding: 'claude',
+        fading: { v: 1 as const, budgetTokens: 50_000, masked: true },
+        fadingTiers: [{ agentId: 'agent-123', v: 1 as const, budgetTokens: 50_000, masked: true }],
+      };
+
+      expect(await manager.approvals.pause(streamId, buildAction(streamId), { contextMeta })).toBe(
+        true,
+      );
+
+      const paused = await manager.getJob(streamId);
+      expect(paused?.metadata.contextMeta).toEqual(contextMeta);
+    });
+
+    test('clears the previous pause context meta when a re-pause has none', async () => {
+      const streamId = 'stream-pause-context-meta-cleared';
+      await manager.createJob(streamId, 'user-1');
+      const firstAction = buildAction(streamId);
+      const contextMeta = {
+        calibrationRatio: 1.25,
+        encoding: 'claude',
+        fading: { v: 1 as const, budgetTokens: 50_000, masked: true },
+        fadingTiers: [{ agentId: 'agent-123', v: 1 as const, budgetTokens: 50_000, masked: true }],
+      };
+
+      expect(await manager.approvals.pause(streamId, firstAction, { contextMeta })).toBe(true);
+      expect(await manager.approvals.resolve(streamId, firstAction.actionId)).toBe(true);
+      expect(await manager.approvals.pause(streamId, buildAction(streamId))).toBe(true);
+
+      const repaused = await manager.getJob(streamId);
+      expect(repaused?.status).toBe('requires_action');
+      expect(repaused?.metadata.contextMeta).toBeUndefined();
     });
 
     test('does not write a stale pause or discoveries onto a replacement job', async () => {
@@ -591,6 +659,20 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
       expect(await manager.approvals.pause('nonexistent', buildAction('nonexistent'))).toBe(false);
     });
 
+    test('replacing a paused generation removes its approval and rejects a late decision', async () => {
+      const streamId = 'stream-replace-paused-generation';
+      const predecessor = await manager.createJob(streamId, 'user-1');
+      const action = buildAction(streamId);
+      await manager.approvals.pause(streamId, action);
+      const replacement = await manager.createJob(streamId, 'user-1');
+
+      expect(replacement.createdAt).not.toBe(predecessor.createdAt);
+      expect(await manager.approvals.peek(streamId)).toBeNull();
+      expect((await manager.getResumeState(streamId))?.pendingAction).toBeUndefined();
+      expect(await manager.approvals.resolve(streamId, action.actionId)).toBe(false);
+      expect(await manager.getJobStatus(streamId)).toBe('running');
+    });
+
     test('a predecessor interrupt cannot pause a replacement generation', async () => {
       const streamId = 'stream-pause-epoch-fence';
       const predecessor = await manager.createJob(streamId, 'user-1');
@@ -667,6 +749,43 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
       expect(await manager.approvals.resolve(streamId)).toBe(true);
       expect(await manager.getJobStatus(streamId)).toBe('running');
       expect(await manager.approvals.peek(streamId)).toBeNull();
+    });
+
+    test('clears the predecessor Event Actor suspension projection on resume', async () => {
+      const streamId = 'stream-resolve-event-actor-suspension';
+      const job = await manager.createJob(streamId, 'user-1', streamId, {
+        initialMetadata: { providerExecutionId: 'provider-paused' },
+      });
+      const pausedProviderExecutionId = job.metadata.providerExecutionId!;
+      const action = buildAction(streamId);
+      expect(
+        await manager.beginProviderExecution(streamId, job.createdAt, pausedProviderExecutionId),
+      ).toBe(true);
+      await manager.approvals.pause(streamId, action, {
+        expectedCreatedAt: job.createdAt,
+        agentEventSuspension: { version: 1, suspensionId: 'suspension-1', attempt: 0 },
+      });
+
+      expect(
+        await manager.approvals.resolve(
+          streamId,
+          action.actionId,
+          { providerExecutionId: 'provider-resume', providerDrained: true },
+          job.createdAt,
+        ),
+      ).toBe(true);
+      await expect(manager.getJob(streamId)).resolves.toMatchObject({
+        status: 'running',
+        metadata: { providerExecutionId: 'provider-resume' },
+      });
+      expect((await manager.getJob(streamId))?.metadata.agentEventSuspension).toBeUndefined();
+      expect((await manager.getJob(streamId))?.metadata.providerExecutionStartedId).toBeUndefined();
+      expect(await manager.beginProviderExecution(streamId, job.createdAt, 'provider-resume')).toBe(
+        true,
+      );
+      expect((await manager.getJob(streamId))?.metadata.providerExecutionStartedId).toBe(
+        'provider-resume',
+      );
     });
 
     test('a concurrent double-resolve wins exactly once (race-safe)', async () => {
@@ -919,6 +1038,22 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
         'Approval expired before a decision was made',
         job.createdAt,
       );
+
+      subscription?.unsubscribe();
+    });
+
+    test('does not invoke local expiry fallback when publication is fenced', async () => {
+      const streamId = 'stream-expire-publication-fenced';
+      const job = await manager.createJob(streamId, 'user-1');
+      const onError = jest.fn();
+      const subscription = await manager.subscribe(streamId, () => undefined, undefined, onError);
+      await manager.approvals.pause(streamId, buildAction(streamId));
+      jest.spyOn(eventTransport, 'emitError').mockImplementation(() => {
+        throw new GenerationPublicationFencedError('error', streamId, job.createdAt);
+      });
+
+      expect(await manager.expireApproval(streamId)).toBe(true);
+      expect(onError).not.toHaveBeenCalled();
 
       subscription?.unsubscribe();
     });

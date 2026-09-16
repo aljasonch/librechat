@@ -1,4 +1,5 @@
 const { randomUUID } = require('crypto');
+const { isDeepStrictEqual } = require('util');
 const { logger } = require('@librechat/data-schemas');
 const {
   Constants,
@@ -10,6 +11,7 @@ const {
 const {
   checkAccess,
   GenerationJobManager,
+  GENERATION_RECOVERY_FAILED_ERROR,
   isPendingActionStale,
   mapToolApprovalResolutions,
   resolveAskUserQuestionResume,
@@ -21,6 +23,7 @@ const {
   findDisallowedDecisions,
   findIncompleteDecisions,
   computeAgentRequestFingerprint,
+  computeLegacyAgentRequestFingerprint,
   captureAgentCheckpointGeneration,
   deleteAgentCheckpoint,
   buildAbortedResponseMetadata,
@@ -29,6 +32,7 @@ const {
   getAgentCheckpointer,
   isContentFilterError,
   preflightResumeContent,
+  reportLocatorTraversalFailure,
   getResumeProvenance,
   getUserFacingResumeError,
   decrementPendingRequest,
@@ -39,6 +43,13 @@ const {
   createMCPRuntimeRequestBody,
   getSafeErrorMetadata,
   isAgentEventRetentionActive,
+  resumeAgentEventActor,
+  settleAgentEventActorHistoryTurn,
+  createAgentEventActionRecorder,
+  createAgentEventActorDetachedActionLifecycle,
+  findAgentEventAppliedAction,
+  assertCodeExecutionApprovalBinding,
+  collectReachableAgents,
 } = require('@librechat/api');
 const { disposeClient } = require('~/server/cleanup');
 const { decryptMetadata } = require('~/server/services/ActionService');
@@ -56,8 +67,18 @@ const {
   getActions,
   getUserMemories,
   getRoleByName,
+  getAgentTriggerDelivery,
   isSubagentOwnerAdmissible,
+  getAgentEventActorSnapshot,
+  commitAgentEventActorState,
+  storeAgentEventActorSuspension,
+  claimAgentEventActorSuspension,
+  settleAgentEventActorSuspension,
+  recordAgentEventActorReconciliation,
   completeAgentEventActorLegacyTurn,
+  reserveAgentEventActorDetachedAction,
+  markAgentEventActorDetachedActionRunning,
+  settleAgentEventActorDetachedAction,
 } = require('~/models');
 const {
   acquireEventChildGenerationLease,
@@ -92,6 +113,25 @@ function sendGenerationJson(res, status, body, generationProtocolVersion) {
  */
 const STEER_RESUME_SETUP_TIMEOUT_MS = 1000;
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function getSuspendedEventActorExpectedAction(suspension) {
+  const payload = suspension?.interrupt?.payload;
+  const expectedAction =
+    payload != null && typeof payload === 'object' && !Array.isArray(payload)
+      ? payload._librechatEventActor?.expectedAction
+      : undefined;
+  return expectedAction != null && typeof expectedAction === 'object' ? expectedAction : undefined;
+}
+
 /**
  * New jobs are physically isolated by an immutable saver namespace, so a
  * terminal owner deletes the whole namespace and catches writes that landed
@@ -120,12 +160,15 @@ async function sealResumedLegacyEventActorTurn({ userId, conversationId, metadat
     return;
   }
   try {
-    const sealed = await completeAgentEventActorLegacyTurn({
-      user: userId,
-      conversationId,
-      ...(metadata?.tenantId == null ? {} : { tenantId: metadata.tenantId }),
-      token,
-    });
+    const sealed = await settleAgentEventActorHistoryTurn(
+      {
+        user: userId,
+        conversationId,
+        ...(metadata?.tenantId == null ? {} : { tenantId: metadata.tenantId }),
+        token,
+      },
+      completeAgentEventActorLegacyTurn,
+    );
     if (!sealed) {
       logger.error(
         `[event-actor] Resumed legacy turn fence ${token} was not sealed; forks stay blocked until bounded reclaim`,
@@ -156,6 +199,7 @@ async function deleteFailedResumeCheckpoint(args, context) {
 const GENERIC_RESUME_ERROR = 'Resume failed';
 
 const resumeContentProtectionDependencies = {
+  onTraversalFailure: reportLocatorTraversalFailure,
   getAgentCheckpointer,
   checkAccess,
   getMessages,
@@ -271,7 +315,9 @@ async function persistRePauseProgress({ req, client, job, streamId, conversation
     {
       userId,
       isTemporary: meta.isTemporary ?? req.body?.isTemporary,
-      expiredAt: req._agentEventBindingRetention?.expiredAt,
+      expiredAt:
+        req._agentEventBindingRetention?.expiredAt ??
+        (meta.retentionExpiresAt ? new Date(meta.retentionExpiresAt) : undefined),
       interfaceConfig: req?.config?.interfaceConfig,
     },
     {
@@ -347,6 +393,7 @@ async function finalizeResumedTurn({
   conversationId,
   addTitle,
   checkpointGeneration,
+  appliedEventActor,
 }) {
   const userId = req.user.id;
   const checkpointerCfg = req.config?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
@@ -408,6 +455,8 @@ async function finalizeResumedTurn({
   const preemptIncomplete =
     (preemptStats?.emptyBoundaries ?? 0) > 0 ||
     client?.run?.getHaltReason?.() === 'preempt_incomplete';
+  /** Same honest-incomplete contract for a resumed turn that runs out of steps. */
+  const stepLimitReached = client?.stepLimitReached === true;
 
   const responseMessage = {
     messageId: responseMessageId,
@@ -418,7 +467,8 @@ async function finalizeResumedTurn({
     endpoint: meta.endpoint,
     iconURL: meta.iconURL,
     model: meta.model,
-    unfinished: preemptIncomplete,
+    unfinished: preemptIncomplete || stepLimitReached,
+    ...(stepLimitReached && { finish_reason: Constants.TOOL_CALL_LIMIT_FINISH_REASON }),
     error: false,
     isCreatedByUser: false,
     user: userId,
@@ -458,11 +508,12 @@ async function finalizeResumedTurn({
   if (Object.keys(responseMetadata).length > 0) {
     responseMessage.metadata = responseMetadata;
   }
-  // Carry the resumed run's context-window calibration (BaseClient.sendMessage persists
-  // this on the response). Without it, the NEXT turn can't seed its pruner from this
-  // run and falls back to uncalibrated token accounting.
-  if (client?.contextMeta != null) {
-    responseMessage.contextMeta = client.contextMeta;
+  // Carry the resumed run's compact context meta (calibration and fading tiers), as
+  // BaseClient.sendMessage persists it on the response. Without it, the NEXT turn can't
+  // seed its pruner from this run. A neutral finish unsets what the paused segment
+  // stored on this row, since an omitted field would otherwise survive the save.
+  if (client != null) {
+    responseMessage.contextMeta = client.contextMeta ?? null;
   }
 
   // Win terminal ownership BEFORE the outcome-defining response write. Stop
@@ -489,7 +540,9 @@ async function finalizeResumedTurn({
       {
         userId,
         isTemporary,
-        expiredAt: req._agentEventBindingRetention?.expiredAt,
+        expiredAt:
+          req._agentEventBindingRetention?.expiredAt ??
+          (meta.retentionExpiresAt ? new Date(meta.retentionExpiresAt) : undefined),
         interfaceConfig: req?.config?.interfaceConfig,
       },
       responseMessage,
@@ -497,6 +550,26 @@ async function finalizeResumedTurn({
     );
     if (!savedResponseMessage) {
       throw new Error('Resumed response could not be persisted before terminal publication');
+    }
+    if (appliedEventActor != null) {
+      const recorded = await recordAgentEventActorReconciliation({
+        user: userId,
+        conversationId,
+        ...(req._agentEventBindingTenantId == null
+          ? {}
+          : { tenantId: req._agentEventBindingTenantId }),
+        reconciliation: {
+          invocationId: appliedEventActor.invocationId,
+          actionAdmitted: true,
+          status: 'history_persisted',
+          checkpoint: appliedEventActor.checkpoint,
+          action: appliedEventActor.action,
+          observedAt: new Date(),
+        },
+      });
+      if (!recorded) {
+        throw new Error('Resumed event actor history barrier could not be durably recorded');
+      }
     }
     /** The response row is now the durable history barrier for the resumed
      * legacy turn. Seal its exact pre-pause token before publishing FINAL; a
@@ -553,11 +626,15 @@ async function finalizeResumedTurn({
         scheduledFor: meta.scheduledFor,
         streamId,
         jobCreatedAt: job.createdAt,
-        status: preemptIncomplete ? 'interrupted' : 'success',
+        status: preemptIncomplete || stepLimitReached ? 'interrupted' : 'success',
         conversationId,
         ...(preemptIncomplete && {
           error: 'Scheduled run was interrupted before completion',
         }),
+        ...(stepLimitReached &&
+          !preemptIncomplete && {
+            error: 'Scheduled run reached its tool call limit before completion',
+          }),
       });
     }
 
@@ -636,7 +713,7 @@ async function finalizeResumedTurn({
  */
 const ResumeAgentController = async (req, res, next, initializeClient, addTitle) => {
   const userId = req.user.id;
-  let generationProtocolVersion = negotiateNewGenerationProtocol(req, GenerationJobManager);
+  let generationProtocolVersion = negotiateNewGenerationProtocol(req);
   const { conversationId, actionId, generationCreatedAt } = req.body;
   const streamId = conversationId;
 
@@ -841,7 +918,13 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   // when the paused action carries a fingerprint (in-flight pauses from before this
   // change won't), and recomputed from the resume body's graph-determining fields.
   const pinnedFingerprint = pendingAction.requestFingerprint;
-  if (pinnedFingerprint && pinnedFingerprint !== computeAgentRequestFingerprint(req.body ?? {})) {
+  const pinnedFingerprintV2 = pendingAction.requestFingerprintV2;
+  const legacyFingerprint = computeLegacyAgentRequestFingerprint(req.body ?? {});
+  const currentFingerprint = computeAgentRequestFingerprint(req.body ?? {});
+  if (
+    (pinnedFingerprint && pinnedFingerprint !== legacyFingerprint) ||
+    (pinnedFingerprintV2 && pinnedFingerprintV2 !== currentFingerprint)
+  ) {
     return sendGenerationJson(
       res,
       403,
@@ -964,7 +1047,9 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   let resumeState;
   let preparedContent;
   try {
-    resumeState = await GenerationJobManager.getResumeState(streamId, job.createdAt);
+    resumeState = await GenerationJobManager.getResumeState(streamId, job.createdAt, {
+      validateEarlyBufferRecovery: true,
+    });
     const batchedAnswer =
       mapped.resumeValue?.answers != null &&
       typeof mapped.resumeValue.answers === 'object' &&
@@ -1019,6 +1104,40 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       '[ResumeAgentController] Resume content preflight failed',
       getSafeErrorMetadata(err),
     );
+    if (scheduleId) {
+      const terminalJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+      if (
+        terminalJob?.createdAt === job.createdAt &&
+        terminalJob.status === 'error' &&
+        terminalJob.error === GENERATION_RECOVERY_FAILED_ERROR
+      ) {
+        try {
+          await recordScheduleOutcome({
+            scheduleId,
+            scheduledFor,
+            streamId,
+            jobCreatedAt: job.createdAt,
+            status: 'error',
+            conversationId,
+            error: GENERATION_RECOVERY_FAILED_ERROR,
+          });
+        } catch (scheduleError) {
+          logger.error(
+            '[ResumeAgentController] Failed to settle scheduled recovery failure',
+            getSafeErrorMetadata(scheduleError),
+          );
+        }
+        await deleteFailedResumeCheckpoint(
+          {
+            conversationId,
+            checkpointerCfg,
+            job,
+            checkpointGeneration: await checkpointGenerationPromise,
+          },
+          'scheduled recovery validation failure',
+        );
+      }
+    }
     if (isContentFilterError(err)) {
       return sendGenerationJson(res, err.statusCode, err.body, generationProtocolVersion);
     }
@@ -1145,6 +1264,14 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
 
   let releaseEventChildLease;
   let eventLeaseTransferredToRun = false;
+  let durableEventActorSuspension;
+  let durableEventActorHandlingGenerationCreatedAt;
+  let durableEventActorRequiresDetachedProducer = false;
+  let eventActorResumePromise;
+  let eventActorStartGate;
+  let eventActorContinuationStarted = false;
+  let eventActorActionRecorder;
+  let appliedEventActor;
   const providerExecutionId = randomUUID();
   try {
     if (req._agentEventBindingParentConversationId != null) {
@@ -1243,6 +1370,102 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         await decrementPendingRequest(userId);
         return sendGenerationJson(res, 409, eventActorRejection, generationProtocolVersion);
       }
+      /** Missing means this pause was produced by a pre-durable-suspension
+       * replica and must retain the legacy resume path during rolling deploys.
+       * Presence opts the job into the fail-closed, Conversation-authoritative
+       * protocol; malformed or stale markers never downgrade to legacy. */
+      const suspensionProjection = job.metadata?.agentEventSuspension;
+      if (suspensionProjection != null) {
+        const projectionValid =
+          suspensionProjection.version === 1 &&
+          typeof suspensionProjection.suspensionId === 'string' &&
+          suspensionProjection.suspensionId.length > 0 &&
+          Number.isSafeInteger(suspensionProjection.attempt) &&
+          suspensionProjection.attempt >= 0;
+        const actorSnapshot = projectionValid
+          ? await getAgentEventActorSnapshot({
+              user: userId,
+              conversationId,
+              ...(req._agentEventBindingTenantId == null
+                ? {}
+                : { tenantId: req._agentEventBindingTenantId }),
+            })
+          : undefined;
+        const suspensionRecord = actorSnapshot?.suspension;
+        if (
+          projectionValid &&
+          suspensionRecord?.status === 'pending' &&
+          suspensionRecord.actionId === pendingAction.actionId &&
+          suspensionRecord.jobCreatedAt === job.createdAt &&
+          suspensionRecord.suspension.suspensionId === suspensionProjection.suspensionId &&
+          suspensionRecord.suspension.attempt === suspensionProjection.attempt
+        ) {
+          durableEventActorSuspension = suspensionRecord.suspension;
+          durableEventActorHandlingGenerationCreatedAt =
+            suspensionRecord.handlingGenerationCreatedAt;
+          durableEventActorRequiresDetachedProducer =
+            job.metadata.agentEventDetachedActionProducerRequired === true ||
+            (suspensionRecord.handlingGenerationCreatedAt != null &&
+              job.metadata.agentEventExpectedAction != null) ||
+            job.metadata.agentEventInvocationKey != null ||
+            suspensionRecord.kind === 'internal_completion';
+          const signedExpectedAction = getSuspendedEventActorExpectedAction(
+            durableEventActorSuspension,
+          );
+          if (
+            job.metadata.agentEventExpectedAction != null &&
+            !isDeepStrictEqual(signedExpectedAction, job.metadata.agentEventExpectedAction)
+          ) {
+            const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+            await rollbackUnconsumedScheduleClaim(currentJob);
+            await releaseScheduleFence();
+            await decrementPendingRequest(userId);
+            return sendGenerationJson(
+              res,
+              409,
+              {
+                code: 'EVENT_ACTOR_SUSPENSION_STALE',
+                error: 'This event actor action is no longer current',
+              },
+              generationProtocolVersion,
+            );
+          }
+        } else {
+          const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+          await rollbackUnconsumedScheduleClaim(currentJob);
+          await releaseScheduleFence();
+          await decrementPendingRequest(userId);
+          return sendGenerationJson(
+            res,
+            409,
+            {
+              code: 'EVENT_ACTOR_SUSPENSION_STALE',
+              error: 'This event actor action is no longer current',
+            },
+            generationProtocolVersion,
+          );
+        }
+      }
+      if (
+        durableEventActorSuspension != null &&
+        durableEventActorRequiresDetachedProducer &&
+        !GenerationJobManager.supportsDetachedAgentEventActions
+      ) {
+        const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+        await rollbackUnconsumedScheduleClaim(currentJob);
+        await releaseScheduleFence();
+        await decrementPendingRequest(userId);
+        res.set('Retry-After', '1');
+        return sendGenerationJson(
+          res,
+          503,
+          {
+            code: 'EVENT_ACTOR_RESUME_CAPABILITY_UNAVAILABLE',
+            error: 'A compatible Event Actor resume worker is temporarily unavailable',
+          },
+          generationProtocolVersion,
+        );
+      }
     }
 
     // Atomically claim the resume. The single winner drives the run; a racing second
@@ -1253,18 +1476,12 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     // that releases it, so a store/Redis error here (unlike the clean `!claimed` branch)
     // would leak the concurrency slot until the counter TTL expires — spuriously 429'ing
     // the user when they retry the still-paused approval. Release the slot on that path too.
-    let claimed;
-    try {
-      /** The CAS that reopens steering must also publish THIS owner's seal
-       *  capability. A separate write after status=`running` leaves a window in
-       *  which steer/arm requests read the previous replica's capability. */
-      claimed = await GenerationJobManager.approvals.resolve(
+    const claimJobApproval = () =>
+      GenerationJobManager.approvals.resolve(
         streamId,
         pendingAction.actionId,
         {
           preemptCapable: isSteerPreemptSupported(),
-          // The handover owner's quote handling replaces the previous
-          // replica's flag, mirroring `preemptCapable` above.
           steerQuotesCapable: true,
           providerExecutionId,
           providerDrained: true,
@@ -1272,6 +1489,150 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         },
         job.createdAt,
       );
+    let claimed;
+    try {
+      /** The CAS that reopens steering must also publish THIS owner's seal
+       *  capability. A separate write after status=`running` leaves a window in
+       *  which steer/arm requests read the previous replica's capability. */
+      if (durableEventActorSuspension == null) {
+        claimed = await claimJobApproval();
+      } else {
+        const claimGate = deferred();
+        eventActorStartGate = deferred();
+        const expectedAction = getSuspendedEventActorExpectedAction(durableEventActorSuspension);
+        const actorInvocationId =
+          job.metadata.agentEventInvocationKey ?? job.metadata.agentEventDeliveryKey;
+        let actorInvocationGenerationCreatedAt =
+          job.metadata.agentEventInvocationGenerationCreatedAt ??
+          durableEventActorHandlingGenerationCreatedAt ??
+          (job.metadata.agentEventInvocationKey == null ? job.createdAt : undefined);
+        if (
+          actorInvocationGenerationCreatedAt == null &&
+          job.metadata.agentEventInvocationKey != null
+        ) {
+          const originalDelivery = await getAgentTriggerDelivery(
+            job.metadata.agentEventInvocationKey,
+          );
+          actorInvocationGenerationCreatedAt = originalDelivery?.handling?.generationCreatedAt;
+        }
+        if (
+          durableEventActorRequiresDetachedProducer &&
+          actorInvocationId != null &&
+          Number.isSafeInteger(actorInvocationGenerationCreatedAt) &&
+          req._agentEventBindingId != null
+        ) {
+          req._agentEventDetachedActionLifecycle = createAgentEventActorDetachedActionLifecycle(
+            {
+              user: userId,
+              ...(req._agentEventBindingTenantId == null
+                ? {}
+                : { tenantId: req._agentEventBindingTenantId }),
+              bindingId: req._agentEventBindingId,
+              conversationId,
+              generationCreatedAt: actorInvocationGenerationCreatedAt,
+              turnCreatedAt: job.createdAt,
+              invocationId: actorInvocationId,
+              expectedAction,
+            },
+            {
+              reserveAgentEventActorDetachedAction,
+              markAgentEventActorDetachedActionRunning,
+              settleAgentEventActorDetachedAction,
+              storeMode: () => GenerationJobManager.detachedAgentEventActionStoreMode,
+              persistTerminalEvidence: async (evidence) => {
+                const persisted =
+                  await GenerationJobManager.persistAgentEventDetachedTerminalEvidence(
+                    streamId,
+                    job.createdAt,
+                    evidence,
+                  );
+                if (!persisted) {
+                  throw new Error(
+                    'Detached Event Actor terminal retry evidence could not be staged',
+                  );
+                }
+              },
+              onTerminal: async () => {
+                await GenerationJobManager.retryTerminalHostAction(streamId, job.createdAt);
+              },
+            },
+          );
+        }
+        eventActorActionRecorder = createAgentEventActionRecorder(expectedAction);
+        req._agentEventActionObserver = eventActorActionRecorder.observeToolEnd;
+        eventActorResumePromise = resumeAgentEventActor(
+          {
+            user: userId,
+            conversationId,
+            ...(req._agentEventBindingTenantId == null
+              ? {}
+              : { tenantId: req._agentEventBindingTenantId }),
+            bindingId: req._agentEventBindingId,
+            suspension: durableEventActorSuspension,
+            /** One identity spans the Conversation claim and the job's
+             * provider-owner CAS. A terminal hook can therefore prove whether
+             * an abort won before or after the resume projection. */
+            resumeAttemptId: providerExecutionId,
+            resumeValue: mapped.resumeValue,
+            signal: job.abortController.signal,
+            checkpointer: checkpointerCfg,
+            expectedAction,
+            claimProjection: async () => {
+              try {
+                const projected = await claimJobApproval();
+                claimGate.resolve(projected);
+                return projected;
+              } catch (error) {
+                /** Redis can commit its CAS and lose only the reply. Read back
+                 * this exact resume capability before declaring the earlier
+                 * Conversation claim orphaned. */
+                const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+                if (
+                  currentJob?.createdAt === job.createdAt &&
+                  currentJob.status === 'running' &&
+                  currentJob.metadata?.providerExecutionId === providerExecutionId
+                ) {
+                  claimGate.resolve(true);
+                  return true;
+                }
+                claimGate.reject(error);
+                throw error;
+              }
+            },
+            resume: async (actorContext) => {
+              const start = await eventActorStartGate.promise;
+              return start(actorContext);
+            },
+            readAppliedAction: () =>
+              eventActorActionRecorder.read() ??
+              findAgentEventAppliedAction(
+                expectedAction,
+                client?.run?.getRunSteps?.() ?? [],
+                client?.contentParts ?? [],
+                { userSubmittedMessageFieldPaths },
+              ),
+            readSuspension: () =>
+              req._agentEventDetachedActionLifecycle?.readSuspension() ??
+              client?.readEventActorSuspension(),
+            readResultContext: () => client?.getEventActorContext(),
+          },
+          {
+            getSnapshot: getAgentEventActorSnapshot,
+            commitState: commitAgentEventActorState,
+            storeSuspension: storeAgentEventActorSuspension,
+            claimSuspension: claimAgentEventActorSuspension,
+            settleSuspension: settleAgentEventActorSuspension,
+            recordReconciliation: recordAgentEventActorReconciliation,
+          },
+        );
+        eventActorResumePromise.catch(() => {});
+        claimed = await Promise.race([
+          claimGate.promise,
+          eventActorResumePromise.then(() => {
+            throw new Error('Event actor suspension completed before claiming its job projection');
+          }),
+        ]);
+      }
     } catch (err) {
       const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
       await rollbackUnconsumedScheduleClaim(currentJob);
@@ -1435,23 +1796,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     generationProtocolVersion,
   );
 
-  // Restore the conversation's createdAt so temporal prompt vars ({{current_datetime}},
-  // {{iso_datetime}}, ...) resolve against the SAME anchor the paused graph used rather
-  // than the resume wall-clock. initializeAgent reads `req.conversationCreatedAt`; the
-  // normal path sets it from the convo timestamp (resolveConversationCreatedAt), so mirror
-  // that here. (The original `timezone` is replayed onto req.body via RESUME_CONTEXT_KEYS.)
-  try {
-    const resumedConvo = await getConvo(userId, conversationId);
-    const createdAt = resumedConvo?.createdAt ? new Date(resumedConvo.createdAt) : null;
-    if (createdAt && !Number.isNaN(createdAt.getTime())) {
-      req.conversationCreatedAt = createdAt.toISOString();
-    }
-  } catch (err) {
-    logger.warn(
-      '[ResumeAgentController] Failed to restore conversation timestamp anchor',
-      getSafeErrorMetadata(err),
-    );
-  }
+  req.turnStartedAt = job.createdAt;
 
   let client = null;
   /** Re-pause progress failures use the action/epoch-scoped terminal CAS. The
@@ -1460,17 +1805,6 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   let pausePersistenceFailed = false;
   let pausePersistenceFailureFinalized = false;
   try {
-    if (
-      !(await GenerationJobManager.beginProviderExecution(
-        streamId,
-        job.createdAt,
-        providerExecutionId,
-      ))
-    ) {
-      throw Object.assign(new Error('Generation stopped before provider resume'), {
-        code: 'RUN_REPLACED',
-      });
-    }
     if (userSubmittedPaths.length > 0) {
       job.metadata.userSubmittedPaths = userSubmittedPaths;
     }
@@ -1490,6 +1824,16 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       );
     }
 
+    const mcpRequestBody =
+      job.metadata.mcpRequestBody ??
+      createMCPRuntimeRequestBody({
+        messageId: job.metadata.responseMessageId,
+        conversationId: streamId,
+        codeEnvironmentMode:
+          req.body.codeEnvironmentMode ?? req.resolvedConversation?.codeEnvironmentMode,
+        codeWorkspaces: req.body.codeWorkspaces ?? req.resolvedConversation?.codeWorkspaces,
+        parentMessageId: job.metadata.userMessage?.messageId ?? Constants.NO_PARENT,
+      });
     const result = await initializeClient({
       req,
       res,
@@ -1497,15 +1841,18 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       signal: job.abortController.signal,
       jobCreatedAt: job.createdAt,
       checkpointNamespace,
-      requestBody:
-        job.metadata.mcpRequestBody ??
-        createMCPRuntimeRequestBody({
-          messageId: job.metadata.responseMessageId,
-          conversationId: streamId,
-          parentMessageId: job.metadata.userMessage?.messageId ?? Constants.NO_PARENT,
-        }),
+      foregroundRunId: mcpRequestBody.messageId,
+      requestBody: mcpRequestBody,
     });
     client = result.client;
+
+    // The user approved the code action against the route/session selected at
+    // pause time. Re-resolve it on this replica and fail before provider/tool
+    // execution if the environment, worker, or workspace scope moved.
+    assertCodeExecutionApprovalBinding(
+      pendingAction.codeExecutionBinding,
+      collectReachableAgents([client.options?.agent, ...(client.agentConfigs?.values() ?? [])]),
+    );
 
     // Bind the rebuilt client to the in-flight turn's identity (no new user message).
     client.conversationId = streamId;
@@ -1516,26 +1863,79 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     client.checkpointNamespace = checkpointNamespace;
     client.responseMessageId = job.metadata.responseMessageId;
     client.parentMessageId = job.metadata.userMessage?.messageId ?? Constants.NO_PARENT;
+    // Seed the rebuilt pruner from the tier and calibration captured at the pause, so the
+    // resumed segment keeps historical tool results byte-identical to the paused one.
+    client.seedContextMeta?.(job.metadata?.contextMeta);
     if (client.contentParts) {
       GenerationJobManager.setContentParts(streamId, client.contentParts, job.createdAt);
     }
 
-    await client.resumeCompletion({
-      resumeValue: mapped.resumeValue,
-      seedContent,
-      runSteps: resumeState?.runSteps ?? [],
-      storedMessages,
-      abortController: job.abortController,
-      // Carry the user's MCP auth so approved MCP tools run with their credentials.
-      userMCPAuthMap: result.userMCPAuthMap,
-      // Replay deferred tools discovered before the pause (captured at pause). The rebuilt
-      // graph passes `messages: []`, so without these the model would lose their schemas.
-      discoveredToolNames: job.metadata?.discoveredTools,
-      activityPhaseSnapshot: job.metadata?.activityPhaseSnapshot,
-    });
+    const resumeClient = () =>
+      client.resumeCompletion({
+        resumeValue: mapped.resumeValue,
+        seedContent,
+        runSteps: resumeState?.runSteps ?? [],
+        storedMessages,
+        abortController: job.abortController,
+        // Carry the user's MCP auth so approved MCP tools run with their credentials.
+        userMCPAuthMap: result.userMCPAuthMap,
+        // Replay deferred tools discovered before the pause (captured at pause). The rebuilt
+        // graph passes `messages: []`, so without these the model would lose their schemas.
+        discoveredToolNames: job.metadata?.discoveredTools,
+        activityPhaseSnapshot: job.metadata?.activityPhaseSnapshot,
+        compactionSemanticIndex: job.metadata?.compactionSemanticIndex,
+      });
+    if (
+      !(await GenerationJobManager.beginProviderExecution(
+        streamId,
+        job.createdAt,
+        providerExecutionId,
+      ))
+    ) {
+      throw Object.assign(new Error('Generation stopped before provider resume'), {
+        code: 'RUN_REPLACED',
+      });
+    }
+    if (eventActorResumePromise == null) {
+      await resumeClient();
+    } else {
+      eventActorContinuationStarted = true;
+      eventActorStartGate.resolve(async (actorContext) => {
+        client.checkpointNamespace = actorContext.checkpointNamespace;
+        client.eventActorCheckpointId = actorContext.checkpointId;
+        client.eventActorInvocationId = actorContext.invocationId;
+        client.eventActorContinuation = actorContext.continuation;
+        return resumeClient();
+      });
+      const actorResult = await eventActorResumePromise;
+      if (actorResult.execution.status === 'suspended') {
+        const suspensionKind = req._agentEventDetachedActionLifecycle?.readSuspension()?.kind;
+        if (suspensionKind === 'internal_completion') {
+          await GenerationJobManager.updateMetadata(
+            streamId,
+            {
+              agentEventSuspension: {
+                version: actorResult.execution.suspension.version,
+                suspensionId: actorResult.execution.suspension.suspensionId,
+                attempt: actorResult.execution.suspension.attempt,
+              },
+            },
+            job.createdAt,
+          );
+        } else if (!(await client.publishStagedApproval(actorResult.execution.suspension))) {
+          throw new Error('Re-paused event actor suspension could not be projected to its job');
+        }
+      } else if (actorResult.execution.status === 'applied') {
+        appliedEventActor = {
+          invocationId: durableEventActorSuspension.invocation.invocationId,
+          checkpoint: actorResult.execution.head.checkpoint,
+          action: actorResult.execution.result.action,
+        };
+      }
+    }
 
     // The model may pause AGAIN (another tool, or a follow-up question). The pending
-    // action is already persisted + emitted; leave the job `requires_action`.
+    // action is durably projected; persist progress before exposing it to clients.
     if (client.pendingApproval) {
       logger.debug(`[ResumeAgentController] Re-paused for approval: ${streamId}`);
       const pauseActionId = client.pendingApproval.actionId;
@@ -1576,6 +1976,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
           }
           throw pausePersistenceError;
         }
+        await client.exposePendingApproval?.();
         const released = await GenerationJobManager.approvals.finishPausePersistence(
           streamId,
           pauseActionId,
@@ -1594,6 +1995,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
             jobCreatedAt: job.createdAt,
             status: 'requires_action',
             conversationId,
+            checkpointNamespace: client.checkpointNamespace,
           });
         }
       } else {
@@ -1635,8 +2037,17 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       conversationId,
       addTitle,
       checkpointGeneration,
+      appliedEventActor,
     });
   } catch (err) {
+    if (
+      eventActorResumePromise != null &&
+      eventActorStartGate != null &&
+      !eventActorContinuationStarted
+    ) {
+      eventActorStartGate.reject(err);
+      await eventActorResumePromise.catch(() => {});
+    }
     logger.error('[ResumeAgentController] Resume failed', getSafeErrorMetadata(err));
     if (pausePersistenceFailed) {
       // failPausePersistence already performed the exact requires_action ->

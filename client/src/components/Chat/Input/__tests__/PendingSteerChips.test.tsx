@@ -17,9 +17,16 @@ const mockRestoreToComposer = jest.fn(() => true);
 const mockEditToComposer = jest.fn();
 const mockShowToast = jest.fn();
 
-jest.mock('@librechat/client', () => ({
-  useToastContext: () => ({ showToast: mockShowToast }),
-}));
+// SteerMenu (rendered under PendingSteerChips) uses MorphIcon; map icon
+// identity so inverted Zap/Clock ternaries fail tests instead of going silent.
+jest.mock('@librechat/client', () => {
+  const { createSteerMorphIconMock } = jest.requireActual('~/../test/mockMorphIcon');
+  return {
+    useToastContext: () => ({ showToast: mockShowToast }),
+    TooltipAnchor: jest.requireActual('@librechat/client').TooltipAnchor,
+    MorphIcon: createSteerMorphIconMock(),
+  };
+});
 
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string) => key,
@@ -140,6 +147,24 @@ describe('PendingSteerChips — ambiguous delivery retry', () => {
       { preempt: false, createdAt: 1, generationProtocolVersion: 2 },
     );
   });
+
+  it('uses semantic destructive roles for a failed steer', () => {
+    renderChips([], {
+      steers: [
+        {
+          steerId: 'failed-steer',
+          text: 'failed message',
+          status: 'failed',
+          createdAt: 1,
+        },
+      ],
+    });
+
+    const row = screen.getByTestId('steer-message-row');
+    expect(row).toHaveClass('border-border-destructive');
+    expect(row.querySelector('svg')).toHaveClass('text-text-destructive');
+    expect(screen.getByText('com_ui_steer_failed')).toHaveClass('text-text-destructive');
+  });
 });
 
 describe('PendingSteerChips — queued primary availability', () => {
@@ -159,6 +184,67 @@ describe('PendingSteerChips — queued primary availability', () => {
 
     expect(screen.queryByText('com_ui_send_now')).toBeNull();
     expect(screen.getByTestId('queued-interrupt-now')).toBeDisabled();
+    expect(mockSendQueuedNow).not.toHaveBeenCalled();
+  });
+});
+
+describe('PendingSteerChips — terminal server state', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('shows a durable rejection as failed work', () => {
+    renderChips([
+      {
+        id: 'rejected-turn',
+        text: 'could not be admitted',
+        createdAt: 1,
+        server: { status: 'rejected', errorCode: 'ADMISSION_FAILED' },
+      },
+    ]);
+
+    expect(screen.getByText('com_ui_queued_turn_failed')).toBeInTheDocument();
+  });
+
+  it('shows indeterminate admission as non-actionable reconciliation work', () => {
+    renderChips([
+      {
+        id: 'indeterminate-turn',
+        text: 'external result unknown',
+        createdAt: 1,
+        server: {
+          id: 'server-indeterminate-1',
+          status: 'indeterminate',
+          errorCode: 'ADMISSION_INDETERMINATE',
+        },
+      },
+    ]);
+
+    expect(screen.getByText('com_ui_queued_turn_reconciliation_required')).toBeInTheDocument();
+    expect(screen.getByLabelText('com_ui_remove_queued')).toBeDisabled();
+    expect(screen.queryByText('com_ui_send_now')).toBeNull();
+  });
+
+  it('dismisses an expired ambiguous receipt without restoring or resending it', () => {
+    renderChips([
+      {
+        id: 'uncertain-turn',
+        text: 'delivery outcome unknown',
+        createdAt: 1,
+        server: {
+          status: 'uncertain',
+          uncertainSince: 1,
+          reconciliationExpired: true,
+        },
+      },
+    ]);
+
+    expect(screen.getByText('com_ui_steer_delivery_unconfirmed')).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText('com_ui_dismiss_unconfirmed_delivery'));
+
+    expect(mockRemoveQueued).toHaveBeenCalledWith('uncertain-turn');
+    expect(mockDiscardQueued).not.toHaveBeenCalled();
+    expect(mockRestoreToComposer).not.toHaveBeenCalled();
     expect(mockSendQueuedNow).not.toHaveBeenCalled();
   });
 });
@@ -238,6 +324,32 @@ describe('PendingSteerChips — queued trash', () => {
       CONVO_ID,
     );
     expect(mockRemoveQueued).toHaveBeenCalledWith('q-recovered');
+  });
+
+  it('discards a dead server row before restoring and removing it', async () => {
+    const dead = {
+      id: 'q-dead',
+      text: 'recover dead work',
+      createdAt: 1,
+      clientRequestId: 'client-dead',
+      server: {
+        id: 'server-dead',
+        status: 'rejected' as const,
+        errorCode: 'ADMISSION_FAILED',
+      },
+    };
+    renderChips([dead]);
+
+    fireEvent.click(screen.getByLabelText('com_ui_remove_queued'));
+
+    await waitFor(() => expect(mockDiscardQueued).toHaveBeenCalledWith(dead));
+    expect(mockRestoreToComposer).toHaveBeenCalledWith(
+      'recover dead work',
+      undefined,
+      { quotes: undefined, manualSkills: undefined },
+      CONVO_ID,
+    );
+    expect(mockRemoveQueued).toHaveBeenCalledWith('q-dead');
   });
 
   it('offers Edit for a recovered row and leaves it untouched when discard is refused', async () => {
@@ -540,4 +652,57 @@ describe('PendingSteerChips — queued interrupt-now', () => {
       expect(await screen.findByText('com_ui_wait_for_tool_steps')).toBeInTheDocument();
     },
   );
+});
+
+describe('PendingSteerChips — queued hint', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  const queuedItem = { id: 'q1', text: 'follow up later', createdAt: 1 };
+  const hintName = 'com_ui_steer_queued_info';
+
+  it('explains when a queued message will send as a hover hint on its clock icon', async () => {
+    renderChips([queuedItem], { steering: { duringRunActive: true } });
+    const clock = screen.getByRole('img', { name: hintName });
+    fireEvent.mouseEnter(clock);
+    /** Ariakit only counts a pointer as moving when consecutive events differ
+     *  in screen coordinates (its NODE_ENV=test shortcut is off under CI's
+     *  NODE_ENV), and it opens the tooltip on a timer after that. */
+    fireEvent.mouseMove(clock, { screenX: 10, screenY: 10 });
+    fireEvent.mouseMove(clock, { screenX: 20, screenY: 20 });
+    const tooltip = await screen.findByRole('tooltip', {}, { timeout: 3000 });
+    expect(tooltip).toHaveTextContent(hintName);
+  });
+
+  it('reaches the same hint from the keyboard: the clock is a tab stop and opens on focus', async () => {
+    const user = userEvent.setup();
+    renderChips([queuedItem], { steering: { duringRunActive: true } });
+    const clock = screen.getByRole('img', { name: hintName });
+    await user.tab();
+    expect(clock).toHaveFocus();
+    const tooltip = await screen.findByRole('tooltip');
+    expect(tooltip).toHaveTextContent(hintName);
+  });
+
+  it('renders no always-visible caption, so the hint costs no composer height at rest', () => {
+    renderChips([queuedItem], { steering: { duringRunActive: true } });
+    expect(screen.queryByText(hintName)).toBeNull();
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('keeps the hint inside each queued row as its icon, never as a stray child of the list', () => {
+    renderChips([queuedItem, { id: 'q2', text: 'and another', createdAt: 2 }], {
+      steering: { duringRunActive: true },
+    });
+    const rows = screen.getAllByTestId('queued-message-row');
+    const clocks = screen.getAllByRole('img', { name: hintName });
+    expect(clocks).toHaveLength(2);
+    rows.forEach((row, index) => expect(row).toContainElement(clocks[index]));
+  });
+
+  it('omits the hint once the run is over, when rows drain on their own terms', () => {
+    renderChips([queuedItem], { steering: { duringRunActive: false } });
+    expect(screen.queryByRole('img', { name: hintName })).toBeNull();
+  });
 });
