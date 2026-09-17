@@ -25,15 +25,15 @@ import {
 } from '~/utils/activityLabels';
 import WorkspaceChanges, { partitionWorkspaceChanges } from './Parts/WorkspaceChanges';
 import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
+import { useUpdateMessageActivityDurationMutation } from '~/data-provider';
 import { MediaContext, MessageContext, SearchContext } from '~/Providers';
 import MemoryArtifacts, { hasMemoryArtifacts } from './MemoryArtifacts';
-import { useUpdateMessageActivityDurationMutation } from '~/data-provider';
 import { hasParallelLanes, parallelLaneGroups } from '~/utils/lanes';
-import { EmptyText, AgentUpdate } from './Parts';
 import PendingSkillCall from './Parts/PendingSkillCall';
 import ActivityPhaseGroup from './ActivityPhaseGroup';
 import { hasPendingApprovalInPart } from '~/utils';
 import EditContentParts from './EditContentParts';
+import { EmptyText, AgentUpdate } from './Parts';
 import ApprovalProvider from './ApprovalContext';
 import Sources from '~/components/Web/Sources';
 import ToolCallGroup from './ToolCallGroup';
@@ -853,7 +853,7 @@ const ContentPartsBody = memo(function ContentPartsBody({
 
     for (let index = 0; index < sequentialParts.length; ) {
       const item = sequentialParts[index];
-      if (!isCreatedByUser && isActivityPart(item.part)) {
+      if (!withinActivityPhase && !isCreatedByUser && isActivityPart(item.part)) {
         const activityBlock: PartWithIndex[] = [];
         let cursor = index;
         while (cursor < sequentialParts.length && isActivityPart(sequentialParts[cursor].part)) {
@@ -882,6 +882,7 @@ const ContentPartsBody = memo(function ContentPartsBody({
     attachmentsForPart,
     hideAttachments,
     isCreatedByUser,
+    withinActivityPhase,
     fallbackScope,
     resolvedToolGroupOccurrences,
   ]);
